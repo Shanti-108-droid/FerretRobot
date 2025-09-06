@@ -1,0 +1,37 @@
+# bridge/routes/bin_qty.py
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+import requests, os
+
+router = APIRouter()
+
+ERP_BASE = os.getenv("ERP_BASE", "http://erp.localhost")
+ERP_TOKEN = os.getenv("ERP_TOKEN", "API_TOKEN")
+
+class BinQtyIn(BaseModel):
+    item_codes: list[str]
+    warehouse: str
+
+@router.post("/bridge/bin-qty")
+def bin_qty(req: BinQtyIn):
+    payload = {
+        "doctype": "Bin",
+        "fields": ["item_code","warehouse","actual_qty"],
+        "filters": [
+            ["item_code","in", req.item_codes],
+            ["warehouse","=", req.warehouse],
+        ],
+        "limit_page_length": 500
+    }
+    r = requests.post(
+        f"{ERP_BASE}/api/method/frappe.client.get_list",
+        json=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"token {ERP_TOKEN}",
+        },
+        timeout=10
+    )
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=r.text)
+    return r.json()
