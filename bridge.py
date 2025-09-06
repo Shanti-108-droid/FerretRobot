@@ -24,10 +24,10 @@ load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 # =============================
 # Configuración y headers
 # =============================
-ERP_BASE        = os.getenv("ERP_BASE", "http://erp.localhost")
-ERP_API_KEY     = os.getenv("ERP_API_KEY", "")
-ERP_API_SECRET  = os.getenv("ERP_API_SECRET", "")
-ERP_TOKEN       = os.getenv("ERP_TOKEN")  # opcional: "APIKEY:APISECRET"
+ERP_BASE         = os.getenv("ERP_BASE", "http://erp.localhost")
+ERP_API_KEY      = os.getenv("ERP_API_KEY", "")
+ERP_API_SECRET   = os.getenv("ERP_API_SECRET", "")
+ERP_TOKEN        = os.getenv("ERP_TOKEN")  # opcional: "APIKEY:APISECRET"
 BRIDGE_CACHE_TTL = int(os.getenv("BRIDGE_CACHE_TTL", "20"))  # segundos
 
 # Encabezados para Frappe/ERPNext
@@ -68,7 +68,7 @@ if bin_qty_router:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173","http://127.0.0.1:5173","*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -78,6 +78,7 @@ app.add_middleware(
 class _CacheEntry(BaseModel):
     ts: float
     data: Any
+
 _cache: Dict[str, _CacheEntry] = {}
 
 def _cache_get(key: str) -> Optional[Any]:
@@ -108,11 +109,17 @@ class ItemDetailBody(BaseModel):
     qty: int = 1
     mode: str = "PRESUPUESTO"
 
+class PaymentRow(BaseModel):
+    mode_of_payment: str
+    amount: float
+    account: Optional[str] = None
+
 class ConfirmBody(BaseModel):
     mode: str
     customer: str
     items: list
     discount_pct: float = 0.0
+    payments: Optional[List[PaymentRow]] = None  # para FACTURA
 
 class InterpretBody(BaseModel):
     text: str
@@ -130,6 +137,12 @@ class SearchByQuery(BaseModel):
 class SearchByCodes(BaseModel):
     item_codes: List[str]
     warehouse: str
+
+# ==== BÚSQUEDA DE CLIENTES / PROVEEDORES (mínimo útil) ====
+class PartySearchIn(BaseModel):
+    query: str
+    limit: int = 20
+    page: int = 1
 
 # ========= Utils texto =========
 def strip_accents(s: str) -> str:
@@ -166,6 +179,9 @@ def _pos_profile_str(pos_profile_name: Optional[str] = None) -> str:
         "warehouse": DEFAULTS["warehouse"],
     }
     return json.dumps(payload, ensure_ascii=False)
+
+def _json_headers():
+    return dict(HEADERS_JSON)
 
 def erp_get_list(doctype: str, fields: List[str], filters: Any, limit: int = 20, page: int = 1) -> List[Dict[str, Any]]:
     """
@@ -246,7 +262,56 @@ def bin_qty_bulk(item_codes: List[str], warehouse: str) -> Dict[str, float]:
     _cache_set(key, out)
     return out
 
-# ========= Endpoints existentes =========
+def _erp_list_mops() -> List[Dict[str, Any]]:
+    """
+    Lista modos de pago habilitados y, si hay, sus cuentas por compañía.
+    Devuelve: [{name: "Cash", accounts: [{company, account}, ...]}, ...]
+    """
+    # Modos de pago habilitados
+    mops = erp_get_list(
+        doctype="Mode of Payment",
+        fields=["name", "enabled"],
+        filters=[["Mode of Payment", "enabled", "=", 1]],
+        limit=200,
+        page=1,
+    )
+    names = [m["name"] for m in mops]
+
+    # Cuentas asociadas (child table)
+    try:
+        acc_rows = erp_get_list(
+            doctype="Mode of Payment Account",
+            fields=["parent as mode_of_payment", "company", "default_account as account"],
+            filters=[["Mode of Payment Account", "company", "=", DEFAULTS["company"]]],
+            limit=500,
+            page=1,
+        )
+    except HTTPException:
+        acc_rows = []
+
+    acc_map: Dict[str, List[Dict[str, Any]]] = {}
+    for a in acc_rows:
+        mop = a.get("mode_of_payment")
+        if mop:
+            acc_map.setdefault(mop, []).append({"company": a.get("company"), "account": a.get("account")})
+
+    out = []
+    for n in names:
+        out.append({"name": n, "accounts": acc_map.get(n, [])})
+    return out
+
+# ========= Endpoints =========
+@app.get("/bridge/payment_methods")
+def payment_methods():
+    try:
+        return {"message": _erp_list_mops()}
+    except requests.HTTPError as e:
+        status = e.response.status_code if getattr(e, "response", None) else 502
+        detail = getattr(e.response, "text", str(e))
+        raise HTTPException(status_code=status, detail=detail)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/__env")
 def __env():
     tp = (ERP_TOKEN[:6] + "...") if ERP_TOKEN else ""
@@ -372,7 +437,7 @@ def search_items(body: SearchBody):
 
     except requests.HTTPError as e:
         status = e.response.status_code if getattr(e, "response", None) else 502
-        detail = getattr(e.response, "text", str(e))
+        detail = getattr(e, "response", None).text if getattr(e, "response", None) else str(e)
         raise HTTPException(status_code=status, detail=detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -412,17 +477,17 @@ def item_detail(body: ItemDetailBody):
             "transaction_type": "selling",
             "update_stock": update_stock,
             "price_list": DEFAULTS["price_list"],
-        "price_list_currency": DEFAULTS["currency"],
-        "plc_conversion_rate": 1,
-        "conversion_rate": 1,
+            "price_list_currency": DEFAULTS["currency"],
+            "plc_conversion_rate": 1,
+            "conversion_rate": 1,
         }
 
         payload = {
             "warehouse": DEFAULTS["warehouse"],
             "price_list": DEFAULTS["price_list"],
-        "price_list_currency": DEFAULTS["currency"],
-        "plc_conversion_rate": 1,
-        "conversion_rate": 1,
+            "price_list_currency": DEFAULTS["currency"],
+            "plc_conversion_rate": 1,
+            "conversion_rate": 1,
             "pos_profile": _pos_profile_str(DEFAULTS["pos_profile"]),
             "doc": json.dumps(doc, ensure_ascii=False),
             "item": json.dumps(item, ensure_ascii=False),
@@ -434,15 +499,142 @@ def item_detail(body: ItemDetailBody):
 
     except requests.HTTPError as e:
         status = e.response.status_code if getattr(e, "response", None) else 502
-        detail = getattr(e.response, "text", str(e))
+        detail = getattr(e, "response", None).text if getattr(e, "response", None) else str(e)
         raise HTTPException(status_code=status, detail=detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ===== /bridge/confirm REAL =====
 @app.post("/bridge/confirm")
 def confirm_document(body: ConfirmBody):
-    prefix = "QTN" if body.mode.upper() == "PRESUPUESTO" else "SINV" if body.mode.upper() == "FACTURA" else "DN"
-    return {"ok": True, "number": f"{prefix}-DEMO-0001"}
+    """
+    Crea el documento real:
+      - PRESUPUESTO -> Quotation (borrador)
+      - FACTURA     -> Sales Invoice (submit)  **requiere payments explícitos**
+      - REMITO      -> Delivery Note (submit)
+    """
+    try:
+        mode = (body.mode or "").upper()
+        if mode not in ("PRESUPUESTO", "FACTURA", "REMITO"):
+            raise HTTPException(status_code=400, detail=f"Modo inválido: {body.mode}")
+        if not body.items:
+            raise HTTPException(status_code=400, detail="No hay ítems para confirmar.")
+        if not AUTH_HEADER:
+            raise HTTPException(status_code=500, detail="ERP auth no configurada.")
+
+        # Mapeo determinístico
+        if mode == "PRESUPUESTO":
+            doctype = "Quotation"
+        elif mode == "FACTURA":
+            doctype = "Sales Invoice"
+        else:
+            doctype = "Delivery Note"
+
+        customer = body.customer or DEFAULTS["customer"]
+
+        doc = {
+            "doctype": doctype,
+            "company": DEFAULTS["company"],
+            "currency": DEFAULTS["currency"],
+            "customer": customer,
+            "set_warehouse": DEFAULTS["warehouse"],
+            "price_list": DEFAULTS["price_list"],
+            "apply_discount_on": "Grand Total",
+            "additional_discount_percentage": float(body.discount_pct or 0),
+            "items": [
+                {
+                    "item_code": it.get("item_code"),
+                    "qty": float(it.get("qty", 1)),
+                    "uom": it.get("uom") or "Nos",
+                    "warehouse": DEFAULTS["warehouse"],
+                    "price_list_rate": float(it.get("price_list_rate", 0) or 0),
+                }
+                for it in body.items
+            ],
+        }
+
+        if doctype == "Quotation":
+            doc.update({"quotation_to": "Customer"})
+        elif doctype == "Sales Invoice":
+            doc.update({
+                "is_pos": 1,
+                "pos_profile": DEFAULTS["pos_profile"],
+                "update_stock": 1 if DEFAULTS.get("warehouse") else 0,
+            })
+
+        # 1) Insert
+        r_ins = requests.post(
+            f"{ERP_BASE}/api/resource/{doctype}",
+            headers=_json_headers(),
+            data=json.dumps(doc),
+            timeout=60,
+        )
+        if r_ins.status_code != 200:
+            raise HTTPException(status_code=r_ins.status_code, detail=r_ins.text)
+        created = r_ins.json().get("data") or {}
+
+        # 1.5) FACTURA requiere payments
+        if doctype == "Sales Invoice":
+            if not body.payments or len(body.payments) == 0:
+                mops = _erp_list_mops()
+                raise HTTPException(
+                    status_code=400,
+                    detail=json.dumps({
+                        "code": "PAYMENT_REQUIRED",
+                        "message": "Elegí un modo de pago y reenviá la confirmación con 'payments'.",
+                        "payment_methods": mops,
+                    }, ensure_ascii=False),
+                )
+
+            grand = float(created.get("grand_total") or 0)
+            paid_total = sum(float(p.amount or 0) for p in body.payments)
+            if paid_total <= 0:
+                paid_total = grand
+
+            payments_payload = []
+            for p in body.payments:
+                row = {"mode_of_payment": p.mode_of_payment, "amount": float(p.amount)}
+                if p.account:
+                    row["account"] = p.account
+                payments_payload.append(row)
+
+            r_upd = requests.put(
+                f"{ERP_BASE}/api/resource/{doctype}/{created.get('name')}",
+                headers=_json_headers(),
+                data=json.dumps({
+                    "payments": payments_payload,
+                    "paid_amount": paid_total
+                }),
+                timeout=60,
+            )
+            if r_upd.status_code != 200:
+                raise HTTPException(status_code=r_upd.status_code, detail=r_upd.text)
+            created = r_upd.json().get("data") or created
+
+        # 2) Submit (Factura/Remito)
+        if doctype in ("Sales Invoice", "Delivery Note"):
+            r_sub = requests.post(
+                f"{ERP_BASE}/api/method/frappe.client.submit",
+                headers=_json_headers(),
+                data=json.dumps({"doc": created}),
+                timeout=60,
+            )
+            if r_sub.status_code != 200:
+                raise HTTPException(status_code=r_sub.status_code, detail=r_sub.text)
+            submitted = r_sub.json().get("message") or {}
+            return {"ok": True, "number": submitted.get("name"), "doc": submitted}
+
+        # Quotation queda en borrador
+        return {"ok": True, "number": created.get("name"), "doc": created}
+
+    except requests.HTTPError as e:
+        status = e.response.status_code if getattr(e, "response", None) else 502
+        detail = getattr(e, "response", None).text if getattr(e, "response", None) else str(e)
+        raise HTTPException(status_code=status, detail=detail)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/bridge/interpret")
 def interpret(body: InterpretBody):
@@ -508,20 +700,20 @@ def codes_with_stock(payload: SearchByCodes):
 def cache_clear():
     _cache.clear()
     return {"ok": True, "size": 0}
-# ==== BÚSQUEDA DE CLIENTES / PROVEEDORES (mínimo útil) ====
-class PartySearchIn(BaseModel):
-    query: str
-    limit: int = 20
-    page: int = 1
 
-def _erp_get_list_party(doctype: str, fields: list[str], q: str, limit: int, page: int):
+# ==== BÚSQUEDA DE CLIENTES / PROVEEDORES (mínimo útil) ====
+def _erp_get_list_party(doctype: str, fields: List[str], q: str, limit: int, page: int):
+    if not AUTH_HEADER:
+        raise HTTPException(status_code=500, detail="ERP auth no configurada.")
     url = f"{ERP_BASE}/api/method/frappe.client.get_list"
+    # Usamos OR entre varios campos típicos
+    name_field = fields[1] if len(fields) > 1 else "name"
     payload = {
         "doctype": doctype,
         "fields": fields,
         "or_filters": [
             [doctype, "name", "like", f"%{q}%"],
-            [doctype, fields[1] if len(fields) > 1 else "name", "like", f"%{q}%"],
+            [doctype, name_field, "like", f"%{q}%"],
             [doctype, "mobile_no", "like", f"%{q}%"],
             [doctype, "email_id", "like", f"%{q}%"],
             [doctype, "tax_id", "like", f"%{q}%"],
@@ -530,19 +722,7 @@ def _erp_get_list_party(doctype: str, fields: list[str], q: str, limit: int, pag
         "limit_start": (max(page, 1) - 1) * limit,
         "order_by": "modified desc",
     }
-
-    # Usa HEADERS global si existe; si no, lo arma acá
-    try:
-        hdrs = HEADERS  # type: ignore[name-defined]
-    except NameError:
-        token = ERP_TOKEN if ERP_TOKEN else f"{ERP_API_KEY}:{ERP_API_SECRET}"
-        hdrs = {
-            "Authorization": f"token {token}",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Accept": "application/json",
-        }
-
-    r = requests.post(url, headers={**hdrs, "Content-Type":"application/json", "Accept":"application/json"}, data=json.dumps(payload), timeout=30)
+    r = requests.post(url, headers=HEADERS_JSON, data=json.dumps(payload), timeout=30)
     r.raise_for_status()
     return r.json().get("message", [])
 
@@ -557,7 +737,7 @@ def search_customers(payload: PartySearchIn):
         return {"message": rows}
     except requests.HTTPError as e:
         status = e.response.status_code if getattr(e, "response", None) else 502
-        detail = getattr(e.response, "text", str(e))
+        detail = getattr(e, "response", None).text if getattr(e, "response", None) else str(e)
         raise HTTPException(status_code=status, detail=detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -573,7 +753,7 @@ def search_suppliers(payload: PartySearchIn):
         return {"message": rows}
     except requests.HTTPError as e:
         status = e.response.status_code if getattr(e, "response", None) else 502
-        detail = getattr(e.response, "text", str(e))
+        detail = getattr(e, "response", None).text if getattr(e, "response", None) else str(e)
         raise HTTPException(status_code=status, detail=detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
