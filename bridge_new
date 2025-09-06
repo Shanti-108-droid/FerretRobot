@@ -1,0 +1,116 @@
+# bridge_new.py
+import os, json
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from routes.bin_qty import router as bin_qty_router
+import httpx
+
+# --- .env ---
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+ERP_BASE_URL = os.getenv("ERP_BASE_URL", "http://erp.localhost").rstrip("/")
+ERP_API_KEY  = os.getenv("ERP_API_KEY", "")
+ERP_API_SECRET = os.getenv("ERP_API_SECRET", "")
+POS_PROFILE_NAME = os.getenv("POS_PROFILE", "Sucursal Adrogue")
+POS_PRICE_LIST   = os.getenv("POS_PRICE_LIST", "Standard Selling")
+POS_WAREHOUSE    = os.getenv("POS_WAREHOUSE", "Sucursal Adrogue - HT")
+
+app = FastAPI()
+app.include_router(bin_qty_router)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173","http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+def build_pos_profile_string():
+    """
+    POS Awesome espera 'pos_profile' como STRING JSON.
+    En el servidor hacen json.loads(pos_profile).
+    """
+    payload = {
+        "name": POS_PROFILE_NAME,
+        "price_list": POS_PRICE_LIST,
+        "warehouse": POS_WAREHOUSE,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+@app.post("/bridge/search")
+async def bridge_search(req: Request):
+    body = await req.json()
+    term  = (body.get("search_term") or body.get("q") or "").strip()
+    limit = body.get("page_length") or body.get("limit") or 20
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 20
+
+    if not term:
+        return {"ok": False, "error": "search_term vacío"}
+
+    headers = {}
+    if ERP_API_KEY and ERP_API_SECRET:
+        headers["Authorization"] = f"token {ERP_API_KEY}:{ERP_API_SECRET}"
+
+    url = f"{ERP_BASE_URL}/api/method/posawesome.posawesome.api.posapp.get_items"
+    payload = {
+        "search_term": term,
+        "page_length": limit,
+        "pos_profile": build_pos_profile_string(),  # STRING JSON
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as cli:
+            r = await cli.post(url, headers=headers, json=payload)
+            status = r.status_code
+            text = r.text
+            # Intentar parsear JSON; si no se puede, devolvemos el texto crudo
+            try:
+                data = r.json()
+            except Exception:
+                return {
+                    "ok": False,
+                    "erp_status": status,
+                    "erp_raw_text": text[:2000],
+                    "note": "ERP devolvió texto no-JSON"
+                }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    # Si viene una excepción del ERP, mostrarla tal cual
+    if "exception" in data or "exc" in data:
+        return {
+            "ok": False,
+            "erp_status": status,
+            "erp_raw_json": data,
+            "note": "ERP devolvió error"
+        }
+
+    items = data.get("message") or data.get("items") or []
+    norm = [{
+        "code": it.get("item_code") or it.get("name"),
+        "name": it.get("item_name") or it.get("description") or it.get("name"),
+        "uom": it.get("stock_uom") or it.get("uom"),
+        "rate": it.get("price_list_rate") or it.get("rate"),
+        "warehouse": it.get("warehouse") or POS_WAREHOUSE,
+    } for it in items]
+
+    return {
+        "ok": True,
+        "term": term,
+        "count": len(norm),
+        "items": norm[:limit],
+        "used_profile": json.loads(build_pos_profile_string()),
+        "erp_status": status,
+        "erp_debug_keys": list(data.keys())[:10]  # para ver qué trae
+    }
