@@ -1,7 +1,8 @@
 # bridge.py — FastAPI microservice (CORS + ERP auth + búsqueda “inteligente” + search_with_stock)
 # Requisitos: pip install fastapi uvicorn requests python-dotenv pydantic
 
-import os, json, unicodedata, re, html, time
+import os, json, unicodedata, re, html, time, logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -29,6 +30,29 @@ ERP_API_KEY      = os.getenv("ERP_API_KEY", "")
 ERP_API_SECRET   = os.getenv("ERP_API_SECRET", "")
 ERP_TOKEN        = os.getenv("ERP_TOKEN")  # opcional: "APIKEY:APISECRET"
 BRIDGE_CACHE_TTL = int(os.getenv("BRIDGE_CACHE_TTL", "20"))  # segundos
+# ==== OpenAI LLM ====
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+LLM_MODEL        = os.getenv("LLM_MODEL", "gpt-4o-mini")
+# === PATCH A (constantes + helper MOP) ===
+BASE_COMPANY   = "Hi Tech"
+BASE_PROFILE   = "Sucursal Adrogue"
+BASE_WAREHOUSE = "Sucursal Adrogue - HT"
+BASE_CURRENCY  = "ARS"
+
+def get_mop_account(mop: str, company: str) -> str | None:
+    """Devuelve la cuenta por defecto para un Mode of Payment y compañía (o None)."""
+    import requests
+    from requests.utils import quote
+    url = f"{ERP_BASE}/api/resource/Mode of Payment/{quote(mop, safe='')}"
+    r = requests.get(url, headers=erp_headers(), timeout=10)
+    if r.status_code != 200:
+        return None
+    data = r.json().get("data", {})
+    for row in (data.get("accounts") or []):
+        if row.get("company") == company and row.get("default_account"):
+            return row["default_account"]
+    return None
+# === /PATCH A ===
 
 # Encabezados para Frappe/ERPNext
 if ERP_TOKEN:
@@ -60,6 +84,18 @@ DEFAULTS = {
     "customer": "Consumidor Final",
     "tax_category": "IVA 21%",
 }
+# ==== Logger rotativo para /bridge/interpret ====
+LOG_DIR = Path(__file__).with_name("logs")
+LOG_DIR.mkdir(exist_ok=True)
+log_file = LOG_DIR / "interpret.log"
+
+logger = logging.getLogger("interpret")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 # ========= App + CORS =========
 app = FastAPI()
@@ -169,6 +205,28 @@ def fields_text(item: Dict[str, Any]) -> str:
     return norm(" ".join(map(str, parts)))
 
 # ========= Helpers ERP =========
+# === helper headers seguro ===
+# === helpers de respuesta unificada ===
+def _ok(number: str | None, doc: dict | None):
+    return {"ok": True, "number": number, "doc": doc, "error": None}
+
+def _err(code: str, message: str, **extra):
+    e = {"code": code, "message": message}
+    e.update(extra or {})
+    return {"ok": False, "number": None, "doc": None, "error": e}
+# === fin helpers ===
+
+
+def _erp_headers() -> dict:
+    """Normaliza AUTH_HEADER para requests."""
+    if isinstance(AUTH_HEADER, dict):
+        return AUTH_HEADER
+    if isinstance(AUTH_HEADER, str):
+        # acepta "token api_key:api_secret" o "Bearer xxx"
+        return {"Authorization": AUTH_HEADER, "Content-Type": "application/json"}
+    raise HTTPException(status_code=500, detail="AUTH_HEADER mal formado (esperaba dict o str)")
+# === fin helper ===
+
 def _pos_profile_str(pos_profile_name: Optional[str] = None) -> str:
     payload = {
         "name": pos_profile_name or DEFAULTS["pos_profile"],
@@ -505,6 +563,26 @@ def item_detail(body: ItemDetailBody):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ===== /bridge/confirm REAL =====
+# === HELPER: cuenta por Mode of Payment ===
+def _mop_account(mode_of_payment: str, company: str) -> str | None:
+    """
+    Devuelve la Default Account del Mode of Payment para la compañía, o None.
+    Requiere ERP_BASE + AUTH_HEADER ya configurados.
+    """
+    import requests
+    from urllib.parse import quote
+    url = f"{ERP_BASE}/api/resource/Mode of Payment/{quote(mode_of_payment, safe='')}"
+    r = requests.get(url, headers=_erp_headers(), timeout=10)
+    if r.status_code != 200:
+        return None
+    data = r.json().get("data", {})
+    for row in (data.get("accounts") or []):
+        if row.get("company") == company and row.get("default_account"):
+            return row["default_account"]
+    return None
+# === fin helper ===
+
+
 @app.post("/bridge/confirm")
 def confirm_document(body: ConfirmBody):
     """
@@ -514,15 +592,18 @@ def confirm_document(body: ConfirmBody):
       - REMITO      -> Delivery Note (submit)
     """
     try:
+        import requests
+
+        # --- Validaciones iniciales
         mode = (body.mode or "").upper()
         if mode not in ("PRESUPUESTO", "FACTURA", "REMITO"):
-            raise HTTPException(status_code=400, detail=f"Modo inválido: {body.mode}")
+            return _err("BAD_MODE", f"Modo inválido: {body.mode}")
         if not body.items:
-            raise HTTPException(status_code=400, detail="No hay ítems para confirmar.")
+            return _err("NO_ITEMS", "No hay ítems para confirmar.")
         if not AUTH_HEADER:
-            raise HTTPException(status_code=500, detail="ERP auth no configurada.")
+            return _err("NO_AUTH", "ERP auth no configurada.")
 
-        # Mapeo determinístico
+        # --- Doctype según modo
         if mode == "PRESUPUESTO":
             doctype = "Quotation"
         elif mode == "FACTURA":
@@ -530,8 +611,25 @@ def confirm_document(body: ConfirmBody):
         else:
             doctype = "Delivery Note"
 
+        # --- Items (usar 'rate' en Sales Invoice, 'price_list_rate' en el resto)
+        items_list = []
+        for it in body.items:
+            base = {
+                "item_code": it.get("item_code"),
+                "qty": float(it.get("qty", 1)),
+                "uom": it.get("uom") or "Nos",
+                "warehouse": DEFAULTS["warehouse"],
+            }
+            price = float(it.get("price_list_rate", it.get("rate", 0)) or 0)
+            if doctype == "Sales Invoice":
+                base["rate"] = price
+            else:
+                base["price_list_rate"] = price
+            items_list.append(base)
+
         customer = body.customer or DEFAULTS["customer"]
 
+        # --- Documento base
         doc = {
             "doctype": doctype,
             "company": DEFAULTS["company"],
@@ -541,20 +639,13 @@ def confirm_document(body: ConfirmBody):
             "price_list": DEFAULTS["price_list"],
             "apply_discount_on": "Grand Total",
             "additional_discount_percentage": float(body.discount_pct or 0),
-            "items": [
-                {
-                    "item_code": it.get("item_code"),
-                    "qty": float(it.get("qty", 1)),
-                    "uom": it.get("uom") or "Nos",
-                    "warehouse": DEFAULTS["warehouse"],
-                    "price_list_rate": float(it.get("price_list_rate", 0) or 0),
-                }
-                for it in body.items
-            ],
+            "items": items_list,
         }
 
+        # --- Ajustes por tipo de doc
         if doctype == "Quotation":
             doc.update({"quotation_to": "Customer"})
+
         elif doctype == "Sales Invoice":
             doc.update({
                 "is_pos": 1,
@@ -562,90 +653,268 @@ def confirm_document(body: ConfirmBody):
                 "update_stock": 1 if DEFAULTS.get("warehouse") else 0,
             })
 
-        # 1) Insert
-        r_ins = requests.post(
-            f"{ERP_BASE}/api/resource/{doctype}",
-            headers=_json_headers(),
-            data=json.dumps(doc),
-            timeout=60,
-        )
-        if r_ins.status_code != 200:
-            raise HTTPException(status_code=r_ins.status_code, detail=r_ins.text)
-        created = r_ins.json().get("data") or {}
-
-        # 1.5) FACTURA requiere payments
-        if doctype == "Sales Invoice":
-            if not body.payments or len(body.payments) == 0:
-                mops = _erp_list_mops()
-                raise HTTPException(
-                    status_code=400,
-                    detail=json.dumps({
-                        "code": "PAYMENT_REQUIRED",
-                        "message": "Elegí un modo de pago y reenviá la confirmación con 'payments'.",
-                        "payment_methods": mops,
-                    }, ensure_ascii=False),
+            # Payments (obligatorios): normalizar Pydantic->dict y completar account por MOP
+            raw_payments = body.payments or []
+            if not raw_payments:
+                return _err(
+                    "PAYMENT_REQUIRED",
+                    "Elegí un modo de pago y reenviá la confirmación con 'payments'.",
+                    payment_methods=[]
                 )
 
-            grand = float(created.get("grand_total") or 0)
-            paid_total = sum(float(p.amount or 0) for p in body.payments)
-            if paid_total <= 0:
-                paid_total = grand
+            payments: list[dict] = []
+            for p in raw_payments:
+                if hasattr(p, "dict"):
+                    p = p.dict()
+                elif not isinstance(p, dict):
+                    p = dict(p)
 
-            payments_payload = []
-            for p in body.payments:
-                row = {"mode_of_payment": p.mode_of_payment, "amount": float(p.amount)}
-                if p.account:
-                    row["account"] = p.account
-                payments_payload.append(row)
+                mop = p.get("mode_of_payment") or p.get("mop") or p.get("mode")
+                if not mop:
+                    return _err("PAYMENT_INVALID", "Falta 'mode_of_payment' en payments.")
 
-            r_upd = requests.put(
-                f"{ERP_BASE}/api/resource/{doctype}/{created.get('name')}",
-                headers=_json_headers(),
-                data=json.dumps({
-                    "payments": payments_payload,
-                    "paid_amount": paid_total
-                }),
-                timeout=60,
+                amt = float(p.get("amount", 0) or 0)
+                acc = p.get("account") or _mop_account(mop, DEFAULTS["company"])
+
+                pay_row = {"mode_of_payment": mop, "amount": amt}
+                if acc:
+                    pay_row["account"] = acc
+                payments.append(pay_row)
+
+            doc["payments"] = payments
+
+        # --- Insert en ERP
+        print(f"→ ERP insert {doctype} for {customer} items={len(doc.get('items', []))}", flush=True)
+        try:
+            r_ins = requests.post(
+                f"{ERP_BASE}/api/resource/{doctype}",
+                headers=_erp_headers(),
+                json={"data": doc},
+                timeout=12,
             )
-            if r_upd.status_code != 200:
-                raise HTTPException(status_code=r_upd.status_code, detail=r_upd.text)
-            created = r_upd.json().get("data") or created
+        except requests.Timeout:
+            return _err("ERP_TIMEOUT", "El ERP no respondió en 12s.")
+        except requests.ConnectionError as e:
+            return _err("ERP_CONN", f"No me pude conectar al ERP: {e}")
+        except requests.RequestException as e:
+            return _err("ERP_HTTP", f"Error HTTP al llamar al ERP: {e}")
 
-        # 2) Submit (Factura/Remito)
+        print(f"← ERP resp {r_ins.status_code}", flush=True)
+
+        if r_ins.status_code != 200:
+            return _err(f"ERP_{r_ins.status_code}", r_ins.text)
+
+        created = r_ins.json().get("data") or {}
+        name = created.get("name")
+
+        # --- Submit para FACTURA y REMITO
         if doctype in ("Sales Invoice", "Delivery Note"):
-            r_sub = requests.post(
-                f"{ERP_BASE}/api/method/frappe.client.submit",
-                headers=_json_headers(),
-                data=json.dumps({"doc": created}),
-                timeout=60,
-            )
+            try:
+                r_sub = requests.post(
+                    f"{ERP_BASE}/api/method/frappe.client.submit",
+                    headers=_erp_headers(),
+                    json={"doc": created},   # enviar el doc completo
+                    timeout=12,
+                )
+            except requests.Timeout:
+                return _err("ERP_TIMEOUT", "El ERP no respondió al submit en 12s.")
+            except requests.ConnectionError as e:
+                return _err("ERP_CONN", f"No me pude conectar al ERP en submit: {e}")
+            except requests.RequestException as e:
+                return _err("ERP_HTTP", f"Error HTTP al hacer submit: {e}")
+
             if r_sub.status_code != 200:
-                raise HTTPException(status_code=r_sub.status_code, detail=r_sub.text)
+                return _err(f"ERP_{r_sub.status_code}", r_sub.text)
+
             submitted = r_sub.json().get("message") or {}
-            return {"ok": True, "number": submitted.get("name"), "doc": submitted}
+            return _ok(submitted.get("name") or name, submitted)
 
         # Quotation queda en borrador
-        return {"ok": True, "number": created.get("name"), "doc": created}
+        return _ok(name, created)
 
-    except requests.HTTPError as e:
-        status = e.response.status_code if getattr(e, "response", None) else 502
-        detail = getattr(e, "response", None).text if getattr(e, "response", None) else str(e)
-        raise HTTPException(status_code=status, detail=detail)
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Cualquier otra excepción inesperada
+        return _err("UNEXPECTED", str(e))
 
+
+# ========= LLM: interpretar texto → lista segura de acciones =========
 @app.post("/bridge/interpret")
 def interpret(body: InterpretBody):
-    t = (body.text or "").lower()
-    if "presupuesto" in t:
-        return {"actions": [{"action": "set_mode", "params": {"mode": "PRESUPUESTO"}}]}
-    if "factura" in t:
-        return {"actions": [{"action": "set_mode", "params": {"mode": "FACTURA"}}]}
-    if "remito" in t:
-        return {"actions": [{"action": "set_mode", "params": {"mode": "REMITO"}}]}
-    return {"actions": [{"action": "search", "params": {"term": body.text}}]}
+    """
+    Usa OpenAI (gpt-4o-mini) para interpretar {text, state, catalog} y devolver:
+      {"actions":[{"action":"...", "params": {...}}, ...]}
+    Reglas:
+      - SOLO acciones de la whitelist (catálogo normalizado).
+      - Si mode == FACTURA y no hay pago seleccionado en el estado, sugerir primero set_payment(...)
+        usando alguno de los métodos válidos del ERP, luego confirm_document().
+    Log:
+      - Guarda request completo y respuesta cruda del modelo en logs/interpret.log (rotativo).
+    """
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada en .env")
+
+    # ---- Normalizar catálogo (acepta varios formatos del front) ----
+    def _normalize_catalog(cat) -> List[str]:
+        allowed: set[str] = set()
+        try:
+            if isinstance(cat, dict):
+                # { actions: [ "set_mode", ... ] } o { actions: [ {action:"set_mode"}, ... ] }
+                arr = cat.get("actions", [])
+                if isinstance(arr, list):
+                    for x in arr:
+                        if isinstance(x, dict) and "action" in x:
+                            allowed.add(str(x["action"]))
+                        elif isinstance(x, str):
+                            allowed.add(x)
+            elif isinstance(cat, list):
+                # ["set_mode", ...] o [{action:"set_mode"}, ...]
+                for x in cat:
+                    if isinstance(x, dict) and "action" in x:
+                        allowed.add(str(x["action"]))
+                    elif isinstance(x, str):
+                        allowed.add(x)
+            elif isinstance(cat, str):
+                # Documento de texto (ACTIONS_DOC). Extrae líneas "- nombre(...)".
+                for line in cat.splitlines():
+                    m = re.search(r"-\s*([a-z_][a-z0-9_]*)\s*\(", line, re.I)
+                    if m:
+                        allowed.add(m.group(1))
+        except Exception:
+            pass
+        # Fallback seguro si viene vacío
+        if not allowed:
+            allowed = {
+                "set_mode","search","select_index","set_qty","add_to_cart",
+                "set_global_discount","set_customer","set_payment",
+                "confirm_document","clear_cart","repeat",
+            }
+        return sorted(allowed)
+
+    catalog_in = body.catalog
+    allowed_actions = _normalize_catalog(catalog_in)
+
+    # ---- Datos del request ----
+    state = body.state or {}
+    user_text = body.text or ""
+
+    # ---- Regla especial para FACTURA ----
+    # Si el front aún no expone "payments" en state, igual inyectamos la instrucción proactiva.
+    mops = []
+    try:
+        mops = _erp_list_mops()
+    except Exception:
+        mops = []
+
+    need_payment_first = str(state.get("mode", "")).upper() == "FACTURA" and not state.get("payments")
+
+    extra_rule = ""
+    if need_payment_first:
+        extra_rule = (
+            "Si el modo actual es FACTURA y el estado no registra un pago seleccionado, "
+            "primero debes emitir la acción set_payment con params {\"mop\":\"<uno de estos métodos>\", \"account\":\"<opcional>\"} "
+            "usando obligatoriamente uno de los siguientes métodos admitidos (con cuentas si las hay):\n"
+            f"{json.dumps(mops, ensure_ascii=False)}\n"
+            "y solo después emitir confirm_document.\n"
+        )
+
+    # ---- Prompts ----
+    system_prompt = (
+        "Sos un parser que convierte la intención del usuario en acciones de UI.\n"
+        "Respondé EXCLUSIVAMENTE un objeto JSON con esta forma exacta:\n"
+        "{\"actions\":[{\"action\":\"<nombre>\",\"params\":{}}]}\n"
+        "No incluyas Markdown, comentarios, ni texto adicional.\n"
+        "Usá solo acciones de la whitelist. Si algo no aplica, devolvé actions: [].\n"
+        + extra_rule +
+        "Whitelist: " + json.dumps(allowed_actions)
+    )
+
+    user_payload = {
+        "text": user_text,
+        "state": state,
+        "hint": "De ser necesario, podés encadenar varias acciones. Ej: buscar → seleccionar → set_qty → add_to_cart → repeat."
+    }
+
+    # ---- Log de request completo ----
+    try:
+        logger.info("REQUEST %s", json.dumps({"text": user_text, "state": state, "catalog": catalog_in}, ensure_ascii=False))
+    except Exception:
+        pass
+
+    # ---- Llamada a OpenAI ----
+    payload = {
+        "model": LLM_MODEL,
+        "temperature": 0.1,
+        "max_tokens": 600,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            data=json.dumps(payload),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        js = resp.json()
+        content = js.get("choices", [{}])[0].get("message", {}).get("content", "")
+        try:
+            logger.info("RAW_RESPONSE %s", content)
+        except Exception:
+            pass
+
+        parsed = json.loads(content) if content else {}
+        candidate_actions = parsed.get("actions", [])
+        if not isinstance(candidate_actions, list):
+            candidate_actions = []
+
+    except Exception as e:
+        # Fallback MUY conservador (mismo comportamiento que tu stub)
+        logger.error("LLM_ERROR %s", repr(e))
+        t = (user_text or "").lower()
+        if "presupuesto" in t:
+            return {"actions": [{"action": "set_mode", "params": {"mode": "PRESUPUESTO"}}]}
+        if "factura" in t:
+            return {"actions": [{"action": "set_mode", "params": {"mode": "FACTURA"}}]}
+        if "remito" in t:
+            return {"actions": [{"action": "set_mode", "params": {"mode": "REMITO"}}]}
+        return {"actions": [{"action": "search", "params": {"term": user_text}}]}
+
+    # ---- Whitelist + saneamiento de params ----
+    safe_actions: List[Dict[str, Any]] = []
+    for a in candidate_actions:
+        try:
+            name = a.get("action")
+            if not isinstance(name, str) or name not in allowed_actions:
+                continue
+            params = a.get("params") or {}
+            if not isinstance(params, dict):
+                params = {}
+            # Opcional: limpieza básica de params para evitar tipos raros
+            clean_params: Dict[str, Any] = {}
+            for k, v in params.items():
+                if isinstance(v, (str, int, float, bool)) or v is None:
+                    clean_params[k] = v
+                else:
+                    # serializa estructuras simples
+                    try:
+                        clean_params[k] = json.loads(json.dumps(v, ensure_ascii=False))
+                    except Exception:
+                        continue
+            safe_actions.append({"action": name, "params": clean_params})
+        except Exception:
+            continue
+
+    try:
+        logger.info("PARSED_ACTIONS %s", json.dumps(safe_actions, ensure_ascii=False))
+    except Exception:
+        pass
+
+    return {"actions": safe_actions}
 
 # ========= NUEVO: endpoints unificados con stock =========
 @app.post("/bridge/search_with_stock")
