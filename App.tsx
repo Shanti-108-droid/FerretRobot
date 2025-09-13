@@ -1,8 +1,11 @@
-import React, { useMemo, useState, useRef } from "react";
+// BEGIN App.tsx
+
+import { useRealtimeVoice } from "./voice/useRealtimeVoice";
+import React, { useMemo, useState, useRef, useEffect } from "react";
 import { ArtPollock } from "./ArtPollock";
 import { CustomerPicker } from "./CustomerPicker";
 import {
-  interpretAndDispatch,
+  // interpretAndDispatch (REMOVIDO: ya lo definimos abajo)
   type ActionsDoc as LLMActionsDoc,
   type FrontState as LLMFrontState,
 } from "./llm/interpret";
@@ -127,8 +130,11 @@ function highlightText(text: string, terms: string[] | undefined) {
 }
 
 // ===== App =====
-export default function POSOverlaySkeleton() {
+export default function App() {
   // Estado
+
+  const resumenRef = useRef<string[]>([]);
+  const pushResumen = (s: string) => { if (s) resumenRef.current.push(s); };
   const [mode, setMode] = useState<Mode>("PRESUPUESTO");
   const [customer, setCustomer] = useState<string>("Consumidor Final");
   const [discountPct, setDiscountPct] = useState<number>(0);
@@ -136,20 +142,309 @@ export default function POSOverlaySkeleton() {
   const [results, setResults] = useState<SearchResult[]>([]);
   const [backendItems, setBackendItems] = useState<BackendItem[]>([]);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const qtyRef = useRef<number>(1);
+  const lastAddRef = useRef<{ key: string; t: number } | null>(null);
   const selectedIndexRef = useRef<number | null>(null);
-  const [qty, setQty] = useState<number>(1); // qty “global” (atajos/voz)
-  const [qtyPer, setQtyPer] = useState<Record<string, number>>({}); // qty por fila
+  const [qty, setQty] = useState<number>(1);
+  const [qtyPer, setQtyPer] = useState<Record<string, number>>({});
   const [cart, setCart] = useState<CartLine[]>([]);
   const [log, setLog] = useState<string[]>([]);
   const [micOn, setMicOn] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(false);
 
-  // Métodos de pago (solo para FACTURA)
+  // 🔧 resultsRef para que onUserText pueda ver “lo último”
+  const resultsRef = useRef<SearchResult[]>([]);
+  useEffect(() => { resultsRef.current = results; }, [results]);
+  // --- API: detalle de ítem (debe estar dentro del componente App)
+  async function apiGetItemDetail(res: SearchResult, qOverride?: number): Promise<CartLine | null> {
+    setLoading(true);
+    try {
+      const q = (qOverride ?? qtyRef.current ?? qty) as number;
+      const r = await fetch(`${BRIDGE_BASE}/bridge/item-detail`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ item_code: res.item_code, qty: q, mode }),
+      });
+      if (!r.ok) throw new Error(`detail status ${r.status}`);
+      const data = await r.json();
+      const m = data?.message ?? {};
+      const unit =
+        typeof m.price_list_rate === "number"
+          ? m.price_list_rate
+          : (res as any).price_list_rate ?? (res as any).rate ?? 0;
+      const uom = m.uom || (res as any).stock_uom || "Nos";
+      const line: CartLine = {
+        item_code: res.item_code,
+        item_name: res.item_name,
+        uom,
+        qty: q,
+        unit_price: unit,
+        subtotal: +(unit * q).toFixed(2),
+        warehouse: "Sucursal Adrogue - HT",
+        taxes: {},
+      };
+      return line;
+    } catch (e: any) {
+      appendLog(`✖ item-detail falló: ${e?.message ?? e}`);
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  }
+  // --- Dispatcher mínimo (cubre lo que usás ahora)
+  type Action = { action: string; params?: Record<string, any> };
+  
+  async function dispatchAction(a: Action) {
+    switch (a.action) {
+      case "search": {
+        const raw = (a.params?.term ?? a.params?.query ?? "").toString();
+        const cleaned = raw.replace(/^\s*(?:busc(?:a|ar|á|ame)?|search|find)\b[:,-]?\s*/i, "");
+        const term = cleaned || raw;
+        const data = await apiSearch(term);
+        setResults(data);
+        resultsRef.current = data;
+        const sel = data.length ? 1 : null;
+        setSelectedIndex(sel);
+        selectedIndexRef.current = sel ?? 0;
+        setSearchTerm(term);
+        appendLog(`buscando: "${term}" (${data.length} resultados)`);
+        break;
+      }
+  
+      case "select_index": {
+        const idx1 = Number(a.params?.index ?? 0);
+        const list = resultsRef.current ?? results;
+        if (!Number.isInteger(idx1) || idx1 < 1 || !list || idx1 > list.length) {
+          appendLog(`índice fuera de rango (${a.params?.index})`);
+          break;
+        }
+        setSelectedIndex(idx1);
+        selectedIndexRef.current = idx1;
+        const it = list[idx1 - 1];
+        const qSel = qtyPer[it?.item_code] ?? qtyRef.current ?? qty;
+        setQty(qSel);
+        qtyRef.current = qSel;
+        appendLog(`seleccionado índice ${idx1} (${it?.item_name ?? it?.item_code ?? "?"})`);
+        break;
+      }
+  
+      case "set_qty": {
+        const qNum = Math.max(1, Math.floor(Number(a.params?.qty ?? 1)));
+        setQty(qNum);
+        qtyRef.current = qNum;
+        appendLog(`cantidad → ${qNum}`);
+        break;
+      }
+  
+      case "add_to_cart": {
+        const list = resultsRef.current ?? results;
+        const idxParam1 = Number(a.params?.index ?? 0);
+        const idx1 = idxParam1 >= 1 ? idxParam1 : Number(selectedIndexRef?.current ?? 0);
+        if (!list || !list.length) { appendLog("no hay resultados (list vacía)"); break; }
+        if (!idx1 || idx1 < 1 || idx1 > list.length) {
+          appendLog(`no hay selección (list_len=${list.length}, sel=${idx1 || 0})`);
+          break;
+        }
+        const res = list[idx1 - 1];
+        const qEff = Number(qtyPer[res.item_code] ?? qtyRef.current ?? qty) || 1;
+        const line = await apiGetItemDetail(res, qEff);
+        if (line) {
+          setCart((c) => [...c, line]);
+          appendLog(`+ ${line.qty} x ${line.item_name} @ ${line.unit_price} → ${line.subtotal}`);
+        }
+        break;
+      }
+  
+      case "confirm_document": {
+        const res = await apiConfirmDocument();
+        if (res.ok) {
+          appendLog(`✔ confirmado (${res.number}) total: ${total.grand.toFixed(2)} ${docState.currency}`);
+          setCart([]); setDiscountPct(0); setQty(1); qtyRef.current = 1;
+        } else {
+          appendLog("✖ error al confirmar");
+        }
+        break;
+      }
+  
+      case "clear_cart": {
+        setCart([]); setDiscountPct(0); setQty(1); qtyRef.current = 1;
+        appendLog("carrito vacío");
+        break;
+      }
+  
+      default:
+        appendLog(`acción desconocida: ${a.action}`);
+    }
+  }
+  
+
+  // Métodos de pago
   const [paymentMethods, setPaymentMethods] = useState<
     { name: string; accounts?: { company?: string; account?: string }[] }[]
   >([]);
   const [paymentSel, setPaymentSel] = useState<{ mop?: string; account?: string }>({});
 
+  // VOZ (hook)
+  const voice = useRealtimeVoice({
+    bridgeBase: BRIDGE_BASE,
+    onUserText: async (raw) => {
+      // Espera hasta 3s a que aparezcan resultados (leyendo ref, no el estado “viejo”)
+      const waitUntilResults = async (timeoutMs = 3000) => {
+        const t0 = Date.now();
+        while (Date.now() - t0 < timeoutMs) {
+          if (resultsRef.current.length > 0) return true;
+          await new Promise((r) => setTimeout(r, 60));
+        }
+        return resultsRef.current.length > 0;
+      };
+
+      // Limpieza
+      let text = (raw || "").trim();
+      const lower = text.toLowerCase().replace(/[.!?]\s*$/g, "");
+      const norm = lower.replace(/\bpor\b/g, " x ").replace(/\s+/g, " ").trim();
+
+      appendLog(`🎙️ usuario: ${text}`);
+
+      // ======== 1) Planner primero (llama al /bridge/interpret) ========
+      try {
+        const resumen = await interpretAndDispatch(text); // ← tu función que llama al backend y ejecuta actions
+        if (resumen) voice.speak(resumen);                // opcional: que diga 1 frase
+        return; // 👈 si interpret resolvió, NO seguimos con atajos
+      } catch (e) {
+        const msg = (e as any)?.message ?? "Error procesando el pedido";
+        appendLog(`✖ voz→interpret: ${msg}`);
+        // No hacemos return: seguimos con atajos como fallback
+      }
+
+      // ======== 2) Atajos locales (fallback) ========
+
+      // MODO
+      if (/^modo\s+(presupuesto|factura|remito)$/i.test(norm)) {
+        const m = norm.match(/^modo\s+(presupuesto|factura|remito)$/i)!;
+        const modo = m[1].toUpperCase();
+        await dispatchAction({ action: "set_mode", params: { mode: modo } });
+        voice.speak(`Modo ${m[1]}.`);
+        return;
+      }
+
+      // “Buscar <algo>”
+      const mBuscar = norm.match(/^(?:busca|buscar|buscá|buscame|buscáme)\s+(.+)$/i);
+      if (mBuscar) {
+        const term = mBuscar[1].trim();
+        await dispatchAction({ action: "search", params: { term } });
+        return;
+      }
+
+      // Fallback 1 palabra → búsqueda
+      if (!/\s/.test(norm) && norm.length >= 2) {
+        await dispatchAction({ action: "search", params: { term: norm } });
+        return;
+      }
+
+      // “ítem N, cantidad Q”
+      const mSelQty = norm.match(/^(?:ítem|item)\s+(\d+)\s*,?\s*cantidad\s+(\d+)$/i);
+      if (mSelQty) {
+        const idx = Number(mSelQty[1]);
+        const q = Math.max(1, Number(mSelQty[2]));
+        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+          voice.speak("Decime primero qué buscar.");
+          return;
+        }
+        await dispatchAction({ action: "select_index", params: { index: idx } });
+        await dispatchAction({ action: "set_qty", params: { qty: q } });
+        return;
+      }
+
+      // “del ítem N agregar Q”
+      const mDelSelAdd = norm.match(/^del\s+(?:ítem|item)\s+(\d+)\s*,?\s*(?:agrega(?:r)?|sumar|añadir|poner)\s*(\d+)\s*(?:unidades?)?$/i);
+      if (mDelSelAdd) {
+        const idx = Number(mDelSelAdd[1]);
+        const q = Math.max(1, Number(mDelSelAdd[2]));
+        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+          voice.speak("Decime primero qué buscar.");
+          return;
+        }
+        await dispatchAction({ action: "select_index", params: { index: idx } });
+        await dispatchAction({ action: "set_qty", params: { qty: q } });
+        await dispatchAction({ action: "add_to_cart", params: { index: idx } });
+        voice.speak("Listo.");
+        return;
+      }
+
+      // “item N agregar Q”
+      const mSelAdd = norm.match(/^(?:ítem|item)\s+(\d+)\s*,?\s*(?:agrega(?:r)?|sumar|añadir|poner)\s*(\d+)?$/i);
+      if (mSelAdd) {
+        const idx = Number(mSelAdd[1]);
+        const qOpt = mSelAdd[2] ? Math.max(1, Number(mSelAdd[2])) : null;
+        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+          voice.speak("Decime primero qué buscar.");
+          return;
+        }
+        await dispatchAction({ action: "select_index", params: { index: idx } });
+        if (qOpt) await dispatchAction({ action: "set_qty", params: { qty: qOpt } });
+        await dispatchAction({ action: "add_to_cart", params: { index: idx } });
+        voice.speak("Listo.");
+        return;
+      }
+
+      // “agregar (el) ítem N (x|por|de Q)?”
+      const mAdd = norm.match(/^(?:agrega(?:r)?|sumar|añadir|poner)\s+(?:el\s+)?(?:ítem|item)\s+(\d+)(?:\s*(?:x|por|de)\s*(\d+))?$/i);
+      if (mAdd) {
+        const idx = Number(mAdd[1]);
+        const qOpt = mAdd[2] ? Math.max(1, Number(mAdd[2])) : null;
+        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+          voice.speak("Decime primero qué buscar.");
+          return;
+        }
+        await dispatchAction({ action: "select_index", params: { index: idx } });
+        if (qOpt) await dispatchAction({ action: "set_qty", params: { qty: qOpt } });
+        await dispatchAction({ action: "add_to_cart", params: { index: idx } });
+        voice.speak("Listo.");
+        return;
+      }
+
+      // “agregar ítem” (sin N)
+      if (/^(?:agrega(?:r)?|sumar|añadir|poner)\s+(?:el\s+)?(?:ítem|item)\b$/i.test(norm)) {
+        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+          voice.speak("Decime primero qué buscar.");
+          return;
+        }
+        const idx = selectedIndex ?? (resultsRef.current.length > 0 ? 1 : null);
+        if (!idx) { appendLog("no hay selección"); return; }
+        await dispatchAction({ action: "select_index", params: { index: idx } });
+        await dispatchAction({ action: "add_to_cart", params: { index: idx } });
+        voice.speak("Listo.");
+        return;
+      }
+
+      // “cantidad Q”
+      const mQty = norm.match(/^(?:cantidad|poner)\s+(\d+)$/i);
+      if (mQty) {
+        const q = Math.max(1, Number(mQty[1]));
+        await dispatchAction({ action: "set_qty", params: { qty: q } });
+        voice.speak(`Cantidad ${q}.`);
+        return;
+      }
+
+      // “ítem N” (selección directa)
+      const mSel = norm.match(/^(?:ítem|item)\s+(\d+)$/i);
+      if (mSel) {
+        const idx = Number(mSel[1]);
+        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+          voice.speak("Decime primero qué buscar.");
+          return;
+        }
+        await dispatchAction({ action: "select_index", params: { index: idx } });
+        return;
+      }
+
+      // Si nada matcheó y el planner falló, último fallback: buscar literal
+      await dispatchAction({ action: "search", params: { term: norm } });
+    },
+
+  });
+
+  // ===== API
   async function loadPaymentMethods() {
     try {
       const r = await fetch(`${BRIDGE_BASE}/bridge/payment_methods`);
@@ -190,7 +485,6 @@ export default function POSOverlaySkeleton() {
     selectedIndexRef.current = n;
   }
 
-  // ===== API
   // /bridge/search_with_stock + filtro + ranking + highlight en el front
   async function apiSearch(term: string): Promise<SearchResult[]> {
     setLoading(true);
@@ -210,7 +504,6 @@ export default function POSOverlaySkeleton() {
       const data = await r.json();
       const list: SearchResult[] = (data && data.message) || [];
 
-      // tokens, filtro (exigir TODOS los tokens en name/code/desc) y score (stock primero + relevancia)
       const toks = tokenizeTerms(term);
       const isMatch = (it: SearchResult) => {
         if (toks.length === 0) return true;
@@ -243,7 +536,6 @@ export default function POSOverlaySkeleton() {
 
       scored.sort((a, b) => b.score - a.score);
 
-      // construir backendItems para highlight + numeración 1..N
       const newBackendItems: BackendItem[] = scored.map((s, idx) => ({
         index: idx + 1,
         code: s.it.item_code,
@@ -258,7 +550,6 @@ export default function POSOverlaySkeleton() {
       }));
       setBackendItems(newBackendItems);
 
-      // devolver solo top N
       return scored.slice(0, 20).map((s) => s.it);
     } catch (e: any) {
       appendLog(`✖ búsqueda falló: ${e?.message ?? e}`);
@@ -269,49 +560,12 @@ export default function POSOverlaySkeleton() {
     }
   }
 
-  async function apiGetItemDetail(res: SearchResult, qOverride?: number): Promise<CartLine | null> {
-    setLoading(true);
-    try {
-      const q = (qOverride ?? qty) as number;
-      const r = await fetch(`${BRIDGE_BASE}/bridge/item-detail`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ item_code: res.item_code, qty: q, mode }),
-      });
-      if (!r.ok) throw new Error(`detail status ${r.status}`);
-      const data = await r.json();
-      const m = data?.message ?? {};
-      const unit =
-        typeof m.price_list_rate === "number"
-          ? m.price_list_rate
-          : (res.price_list_rate ?? res.rate ?? 0);
-      const uom = m.uom || res.stock_uom || "Nos";
-      const line: CartLine = {
-        item_code: res.item_code,
-        item_name: res.item_name,
-        uom,
-        qty: q,
-        unit_price: unit,
-        subtotal: +(unit * q).toFixed(2),
-        warehouse: "Sucursal Adrogue - HT",
-        taxes: {},
-      };
-      return line;
-    } catch (e: any) {
-      appendLog(`✖ item-detail falló: ${e?.message ?? e}`);
-      return null;
-    } finally {
-      setLoading(false);
-    }
-  }
-
 async function apiConfirmDocument(): Promise<{ ok: boolean; number?: string }> {
   setLoading(true);
   try {
-    // Si es FACTURA y no hay selección de pago → pedimos al LLM (front ya hace esto en el botón),
-    // pero por si hay llamados directos:
-    if (mode === "FACTURA" && !paymentSel.mop) {
-      appendLog("Elegí un modo de pago antes de confirmar.");
+    // Guardrail: en FACTURA exigimos un modo de pago seleccionado
+    if (mode === "FACTURA" && !paymentSel?.mop) {
+      appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI')");
       return { ok: false };
     }
 
@@ -327,7 +581,7 @@ async function apiConfirmDocument(): Promise<{ ok: boolean; number?: string }> {
       discount_pct: discountPct,
     };
 
-    if (mode === "FACTURA" && paymentSel.mop) {
+    if (mode === "FACTURA" && paymentSel?.mop) {
       body.payments = [
         {
           mode_of_payment: paymentSel.mop,
@@ -343,14 +597,12 @@ async function apiConfirmDocument(): Promise<{ ok: boolean; number?: string }> {
       body: JSON.stringify(body),
     });
 
-    // Intentamos parsear JSON de error (para PAYMENT_REQUIRED) y, si no, mostramos texto crudo.
     if (!r.ok) {
       let rawText = "";
       try { rawText = await r.text(); } catch {}
       let parsed: any = null;
       try { parsed = rawText ? JSON.parse(rawText) : null; } catch {}
 
-      // 400 con PAYMENT_REQUIRED (bridge ya nos manda los métodos)
       if (r.status === 400) {
         const detail = parsed?.detail ?? parsed ?? rawText;
         let detailObj: any = null;
@@ -362,9 +614,8 @@ async function apiConfirmDocument(): Promise<{ ok: boolean; number?: string }> {
         }
       }
 
-      // Otros códigos (417/403/422/etc): volcamos detalle útil
       const msg = parsed?.detail || parsed?.message || rawText || `(sin detalle)`;
-      appendLog(`✖ confirmar falló: ${r.status} ${msg}`);  // ← ahora verás el texto del ERP
+      appendLog(`✖ confirmar falló: ${r.status} ${msg}`);
       return { ok: false };
     }
 
@@ -378,265 +629,291 @@ async function apiConfirmDocument(): Promise<{ ok: boolean; number?: string }> {
   }
 }
 
-async function interpretAndDispatch(text: string) {
-  try {
-    // Snapshot de resultados numerados que ve el usuario
-    const resultsSnapshot =
-      (backendItems && backendItems.length
-        ? backendItems.map(bi => ({
-            index: bi.index,
-            item_code: bi.code,
-            item_name: bi.name,
-          }))
-        : results.map((r, i) => ({
-            index: i + 1,
-            item_code: r.item_code,
-            item_name: r.item_name,
-          }))) || [];
+  async function interpretAndDispatch(text: string) {
+    try {
+      const resultsSnapshot =
+        (backendItems && backendItems.length
+          ? backendItems.map(bi => ({
+              index: bi.index,
+              item_code: bi.code,
+              item_name: bi.name,
+            }))
+          : results.map((r, i) => ({
+              index: i + 1,
+              item_code: r.item_code,
+              item_name: r.item_name,
+            }))) || [];
 
-    const state = {
-      mode,
-      customer,
-      total: {
-        net: total.net,
-        discount: total.discount,
-        grand: total.grand,
-        currency: docState.currency,
-      },
-      // carrito actual
-      cart: cart.map(c => ({
-        item_code: c.item_code,
-        qty: c.qty,
-        uom: c.uom,
-        unit_price: c.unit_price,
-      })),
-      // contexto que el LLM necesita para entender "ítem 1"
-      results: resultsSnapshot,        // [{index, item_code, item_name}]
-      selected_index: selectedIndex,   // puede ser null
-      qty_hint: qty,                   // la qty “global” de los atajos
-      // pago seleccionado (si existe)
-      payment: (mode === "FACTURA" && paymentSel.mop)
-        ? { mop: paymentSel.mop, account: paymentSel.account || undefined }
-        : undefined,
-    };
+      const state = {
+        mode,
+        customer,
+        total: {
+          net: total.net,
+          discount: total.discount,
+          grand: total.grand,
+          currency: docState.currency,
+        },
+        cart: cart.map(c => ({
+          item_code: c.item_code,
+          qty: c.qty,
+          uom: c.uom,
+          unit_price: c.unit_price,
+        })),
+        results: resultsSnapshot,
+        selected_index: selectedIndex,
+        qty_hint: qty,
+        payment: (mode === "FACTURA" && paymentSel.mop)
+          ? { mop: paymentSel.mop, account: paymentSel.account || undefined }
+          : undefined,
+      };
 
-    const catalogList = [
-      "set_mode","search","select_index","set_qty","add_to_cart",
-      "set_global_discount","set_customer","set_payment",
-      "confirm_document","clear_cart","repeat",
-    ];
+      const catalogList = [
+        "set_mode","search","select_index","set_qty","add_to_cart",
+        "set_global_discount","set_customer","set_payment",
+        "confirm_document","clear_cart","repeat",
+      ];
 
-    const r = await fetch(`${BRIDGE_BASE}/bridge/interpret`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, state, catalog: catalogList }),
-    });
-    if (!r.ok) throw new Error(`/bridge/interpret ${r.status}`);
-    const data = await r.json();
-    const actions = Array.isArray(data?.actions) ? data.actions : [];
+      // === PATCH INICIO: payload con snapshot de results (+ anti-race) ===
+      
+      // 1) Snapshot 1-based de los resultados visibles
+      const plannerResults = (resultsRef.current ?? [])
+        .slice(0, 12)
+        .map((r: any, i: number) => ({
+          index: i + 1,
+          item_code: r.item_code,
+          item_name: r.item_name,
+        }));
+      
+      // 2) Extender el state con ese snapshot
+      const stateForPlanner = {
+        ...state,                // mode, customer, total, selected_index, qty_hint, payment, etc.
+        results: plannerResults, // 👈 clave para referir "ítem N"
+      };
+      
+      // 3) Log rápido para verificar que no esté vacío
+      console.log("→ interpret payload.state.results.length =", stateForPlanner.results?.length || 0);
+      
+      // 4) Anti-race: si la orden depende de “ítem N” y todavía no hay results, reintentar breve
+      const needsIndexAndQtyNow =
+        /\b(ítem|item)\b/i.test(text) &&
+        /\b(agregar|añadir|sumar)\b/i.test(text) &&
+        /\b\d+\b/.test(text);
+      
+      if (needsIndexAndQtyNow && plannerResults.length === 0) {
+        console.log("[voice] evitando race: comando requiere results pero results=0; reintento 150ms");
+        setTimeout(() => interpretAndDispatch(text), 150);
+        return;
+      }
+      
+      // 5) Log del payload final
+      console.log("→ interpret payload", { text, state: stateForPlanner, catalog: catalogList });
+      
+      // 6) POST a /bridge/interpret usando stateForPlanner
+      const r = await fetch(`${BRIDGE_BASE}/bridge/interpret`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, state: stateForPlanner, catalog: catalogList }),
+      });
+      if (!r.ok) throw new Error(`/bridge/interpret ${r.status}`);
+      const data = await r.json();
+      const actions = Array.isArray(data?.actions) ? data.actions : [];
+      console.log("→ interpret actions", JSON.stringify(actions, null, 2));
+      
+      if (actions.length === 0) {
+        appendLog("interpret → sin acciones");
+        return;
+      }
+      // === PATCH FIN ===
+      
+      
+      for (const a of actions) {
+        await dispatchAction(a);
+      }
+      // === PATCH FIN ===
+      
+      for (const a of actions) {
+        await dispatchAction(a);
+      }
+    } catch (e: any) {
+      appendLog(`✖ interpret falló: ${e?.message ?? e}`);
+    }
+  }
 
-    if (actions.length === 0) {
-      appendLog("interpret → sin acciones");
-      return;
+// ===== Dispatcher
+
+async function dispatchAction(a: Action) {
+  switch (a.action) {
+    case "set_mode": {
+      const m = (a.params?.mode ?? "").toString().toUpperCase();
+      if (m === "PRESUPUESTO" || m === "FACTURA" || m === "REMITO") {
+        setMode(m as Mode);
+        appendLog(`modo → ${m}`);
+        if (m === "FACTURA") {
+          setPaymentSel({});
+          loadPaymentMethods();
+        } else {
+          setPaymentSel({});
+        }
+      } else {
+        appendLog(`modo inválido: ${a.params?.mode}`);
+      }
+      break;
     }
 
-    for (const a of actions) {
-      await dispatchAction(a);
+    case "set_payment": {
+      const mop = (a.params?.mop ?? "").toString().trim();
+      const account = (a.params?.account ?? "").toString().trim() || undefined;
+      const amount = a.params?.amount != null ? Number(a.params.amount) : undefined;
+      if (!mop) { appendLog("set_payment: faltan parámetros (mop)."); break; }
+      if (!paymentMethods.length) await loadPaymentMethods();
+      setPaymentSel({ mop, account });
+      appendLog(`pago → ${mop}${account ? ` (${account})` : ""}${amount ? ` por ${amount.toFixed(2)}` : ""}`);
+      break;
     }
-  } catch (e: any) {
-    appendLog(`✖ interpret falló: ${e?.message ?? e}`);
+
+    case "search": {
+      const raw = (a.params?.term ?? a.params?.query ?? "").toString();
+
+      // Si parece una orden con índice/cantidad, re-interpretamos ese texto
+      if (/^\s*(?:item|ítem|\d+)\b/i.test(raw) || /\b(agrega(?:r)?|sumar|poner|añadir)\b/i.test(raw)) {
+        await interpretAndDispatch(raw);
+        break;
+      }
+
+      const cleaned = raw.replace(/^\s*(?:busc(?:a|ar|á|ame)?|search|find)\b[:,-]?\s*/i, "");
+      const term = cleaned || raw;
+
+      const data = await apiSearch(term);
+      setResults(data);
+      resultsRef.current = data;                 // 👈 fuente de verdad inmediata
+      setSelectedIndex(data.length ? 1 : null);
+      selectedIndexRef.current = data.length ? 1 : 0;  // 👈 selección 1-based en el ref
+      setSearchTerm(term);
+      appendLog(`buscando: "${term}" (${data.length} resultados)`);
+      break;
+    }
+
+    case "select_index": {
+      const idx1 = Number(a.params?.index ?? 0); // planner manda 1-based
+      if (!Number.isInteger(idx1) || idx1 < 1) { appendLog(`índice inválido: ${a.params?.index}`); break; }
+    
+      // Usamos lista “viva”: evita estados stale
+      const list = resultsRef.current ?? results;
+      if (!list || idx1 > list.length) { appendLog(`índice fuera de rango (${idx1})`); break; }
+    
+      setSelectedIndex(idx1);              // estado visible 1-based
+      selectedIndexRef.current = idx1;   // ref 1-based para próximas acciones
+    
+      const it = list[idx1 - 1];
+      const qSel = qtyPer[it?.item_code] ?? (qtyRef.current ?? 1);
+      setQty(qSel);
+      qtyRef.current = qSel;             // 👈 mantener ref sincronizada
+      appendLog(`seleccionado índice ${idx1} (${it?.item_name ?? it?.item_code ?? "?"})`);
+      break;
+    }
+
+    
+    case "set_qty": {
+      const qNum = Math.max(1, Math.floor(Number(a.params?.qty ?? 1)));
+      setQty(qNum);
+      qtyRef.current = qNum;             // 👈 usar ref para que add_to_cart vea el valor YA
+      appendLog(`cantidad → ${qNum}`);
+      break;
+    }
+    
+    case "add_to_cart": {
+      const list = resultsRef.current ?? results;
+    
+      // índice 1-based explícito o selección previa 1-based
+      const idxParam1 = Number(a.params?.index ?? 0);
+      const idx1 = idxParam1 >= 1 ? idxParam1 : Number(selectedIndexRef?.current ?? 0);
+    
+      if (!list || !list.length) { appendLog("no hay resultados (list vacía)"); break; }
+      if (!idx1 || idx1 < 1 || idx1 > list.length) {
+        appendLog(`no hay selección (list_len=${list.length}, sel=${idx1 || 0})`);
+        break;
+      }
+    
+      const res = list[idx1 - 1];
+    
+      // 👇 cantidad efectiva: primero qtyRef (sin delay), luego qtyPer/estado
+      const qEff = Number(qtyPer[res.item_code] ?? qtyRef.current ?? qty ?? 1);
+      if (!Number.isFinite(qEff) || qEff <= 0) { appendLog("cantidad inválida (falta set_qty)"); break; }
+    
+      // 👇 anti-duplicado si la voz dispara dos add_to_cart iguales en <500ms
+      const key = `${res.item_code}|${qEff}`;
+      const now = Date.now();
+      if (lastAddRef.current && lastAddRef.current.key === key && now - lastAddRef.current.t < 500) {
+        appendLog("⏩ ignorado duplicado add_to_cart");
+        break;
+      }
+      lastAddRef.current = { key, t: now };
+    
+      const line = await apiGetItemDetail(res, qEff);
+      if (line) {
+        // 👇 Merge en una sola línea si ya existe el mismo ítem/precio/uom
+        setCart((c) => {
+          const i = c.findIndex(
+            (row) =>
+              row.item_code === line.item_code &&
+              row.unit_price === line.unit_price &&
+              row.uom === line.uom
+          );
+          if (i >= 0) {
+            const updated = [...c];
+            const newQty = (Number(updated[i].qty) || 0) + Number(line.qty);
+            const newSubtotal = newQty * Number(line.unit_price);
+            updated[i] = { ...updated[i], qty: newQty, subtotal: newSubtotal };
+            return updated;
+          }
+          return [...c, line];
+        });
+    
+        appendLog(`+ ${line.qty} x ${line.item_name} @ ${line.unit_price} → ${line.subtotal}`);
+      }
+      break;
+    }
+    case "set_global_discount": {
+      if (a.params?.percent != null) {
+        const p = Math.max(0, Math.min(100, Number(a.params.percent)));
+        setDiscountPct(p);
+        appendLog(`descuento → ${p}%`);
+      }
+      break;
+    }
+
+    case "set_customer": {
+      const name = (a.params?.name ?? "").toString().trim();
+      if (name) { setCustomer(name); appendLog(`cliente → ${name}`); }
+      break;
+    }
+
+    case "confirm_document": {
+      const res = await apiConfirmDocument();
+      if (res.ok) {
+        appendLog(`✔ confirmado (${res.number}) total: ${total.grand.toFixed(2)} ${docState.currency}`);
+        setCart([]); setDiscountPct(0); setQty(1);
+      } else appendLog("✖ error al confirmar");
+      break;
+    }
+
+    case "clear_cart": {
+      setCart([]); setDiscountPct(0); setQty(1);
+      appendLog("carrito vacío");
+      break;
+    }
+
+    case "repeat": {
+      appendLog(`TOTAL → neto ${total.net.toFixed(2)} desc ${total.discount.toFixed(2)} = ${total.grand.toFixed(2)} ${docState.currency}`);
+      break;
+    }
+
+    default:
+      appendLog(`acción desconocida: ${a.action}`);
   }
 }
 
-  // ===== Dispatcher
-  type Action = { action: string; params?: Record<string, any> };
-  async function dispatchAction(a: Action) {
-    switch (a.action) {
-      case "set_mode": {
-        const m = (a.params?.mode ?? "").toString().toUpperCase();
-        if (m === "PRESUPUESTO" || m === "FACTURA" || m === "REMITO") {
-          setMode(m as Mode);
-          appendLog(`modo → ${m}`);
-          if (m === "FACTURA") {
-            setPaymentSel({});
-            loadPaymentMethods();
-          } else {
-            setPaymentSel({});
-          }
-        } else {
-          appendLog(`modo inválido: ${a.params?.mode}`);
-        }
-        break;
-      }
-      case "set_payment": {
-        // Asegurarse de tener la lista de métodos para mapear cuentas si hace falta
-        if (paymentMethods.length === 0) {
-          await loadPaymentMethods();
-        }
-
-        const mop = (a.params?.mop ?? "").toString().trim();
-        let account = (a.params?.account ?? "").toString().trim();
-        if (!mop) {
-          appendLog("set_payment → falta 'mop'");
-          break;
-        }
-
-        // Si el LLM mandó account vacío, elegimos la primera cuenta disponible (si hay)
-        if (!account) {
-          const accs = paymentMethods.find(m => m.name === mop)?.accounts || [];
-          if (accs.length > 0) {
-            account = accs[0]?.account || "";
-          }
-        }
-
-        setPaymentSel({
-          mop,
-          account: account || undefined
-        });
-
-        appendLog(`pago → ${mop}${account ? ` (${account})` : ""}`);
-        break;
-      }
-      case "search": {
-       // aceptar 'term' o 'query'
-       const raw = (a.params?.term ?? a.params?.query ?? "").toString();
-
-       // si parece comando (ítem + agregar), mandamos al LLM en vez de buscar literal
-       if (/^\s*(?:item|ítem|\d+)\b/i.test(raw) || /\b(agrega(?:r)?|sumar|poner|añadir)\b/i.test(raw)) {
-         await interpretAndDispatch(raw);
-         break;
-       }
-
-       // limpiar verbos 'buscar'
-       const cleaned = raw.replace(/^\s*(?:busc(?:a|ar|á|ame)?|search|find)\b[:,-]?\s*/i, "");
-       const term = cleaned || raw;
-
-       const data = await apiSearch(term);
-       setResults(data);
-       setSelectedIdx(data.length ? 1 : null);
-       setSearchTerm(term);
-       appendLog(`buscando: "${term}" (${data.length} resultados)`);
-       break;
-     }
-
-
-      
-      case "select_index": {
-        const idx = Number(a.params?.index ?? 0);
-        if (idx >= 1 && idx <= results.length) {
-          setSelectedIdx(idx);
-          const codeSel = results[idx - 1]?.item_code;
-          const qSel = qtyPer[codeSel] ?? qty;
-          setQty(qSel);
-          appendLog(`seleccionado índice ${idx} (${results[idx - 1]?.item_name})`);
-        } else appendLog(`índice fuera de rango (${idx})`);
-        break;
-      }
-      case "set_qty": {
-        const q = Math.max(1, Math.floor(Number(a.params?.qty ?? 1)));
-        setQty(q);
-        appendLog(`cantidad → ${q}`);
-        break;
-      }
-      case "add_to_cart": {
-        // Permitimos que venga el index por params, sino usamos el ref (a prueba de race)
-        const idxParam = Number(a.params?.index ?? 0);
-        const idx = idxParam >= 1 ? idxParam : (selectedIndexRef.current ?? 0);
-
-        if (!idx || idx < 1 || idx > results.length) {
-          appendLog("no hay selección");
-          break;
-        }
-
-        const res = results[idx - 1];
-        const q = qtyPer[res.item_code] ?? qty;
-        const line = await apiGetItemDetail(res, q);
-        if (line) {
-          setCart((c) => [...c, line]);
-          appendLog(`+ ${line.qty} x ${line.item_name} @ ${line.unit_price} → ${line.subtotal}`);
-        }
-        break;
-      }
-
-      case "set_global_discount": {
-        if (a.params?.percent != null) {
-          const p = Math.max(0, Math.min(100, Number(a.params.percent)));
-          setDiscountPct(p);
-          appendLog(`descuento → ${p}%`);
-        }
-        break;
-      }
-      case "set_customer": {
-        const name = (a.params?.name ?? "").toString().trim();
-        if (name) {
-          setCustomer(name);
-          appendLog(`cliente → ${name}`);
-        }
-        break;
-      }
-      case "set_payment": { // ← NUEVO: permite que el LLM elija el pago
-        const mop = (a.params?.mop ?? "").toString().trim();
-        const accountIn = a.params?.account ? (a.params.account + "") : undefined;
-        if (!mop) {
-          appendLog("set_payment: faltó 'mop'");
-          break;
-        }
-        // Si aún no cargamos métodos, los cargo (no bloqueante)
-        if (paymentMethods.length === 0) {
-          loadPaymentMethods();
-        }
-        // Selección de cuenta por default si existe
-        const m = paymentMethods.find((x) => x.name === mop);
-        const account =
-          accountIn ||
-          (m?.accounts && m.accounts.length > 0 ? (m.accounts[0]?.account || undefined) : undefined);
-
-        setPaymentSel({ mop, account });
-        appendLog(`pago → ${mop}${account ? ` (${account})` : ""}`);
-        break;
-      }
-      case "set_payment": {
-        const mop = (a.params?.mop ?? "").toString().trim();
-        const account = (a.params?.account ?? "").toString().trim() || undefined;
-        const amount = a.params?.amount != null ? Number(a.params.amount) : undefined;
-
-        if (!mop) {
-          appendLog("set_payment: faltan parámetros (mop).");
-          break;
-        }
-
-        // si no tenemos métodos cargados, los pedimos (útil cuando el LLM llama directo)
-        if (!paymentMethods.length) {
-          await loadPaymentMethods();
-        }
-
-        setPaymentSel({ mop, account });
-        appendLog(`pago → ${mop}${account ? ` (${account})` : ""}${amount ? ` por ${amount.toFixed(2)}` : ""}`);
-        break;
-      }
-
-      case "confirm_document": {
-        const res = await apiConfirmDocument();
-        if (res.ok) {
-          appendLog(`✔ confirmado (${res.number}) total: ${total.grand.toFixed(2)} ${docState.currency}`);
-          setCart([]); setDiscountPct(0); setQty(1);
-        } else appendLog("✖ error al confirmar");
-        break;
-      }
-      case "clear_cart": {
-        setCart([]); setDiscountPct(0); setQty(1);
-        appendLog("carrito vacío");
-        break;
-      }
-      case "repeat": {
-        appendLog(
-          `TOTAL → neto ${total.net.toFixed(2)} desc ${total.discount.toFixed(2)} = ${total.grand.toFixed(2)} ${docState.currency}`
-        );
-        break;
-      }
-      default: appendLog(`acción desconocida: ${a.action}`);
-    }
-  }
+  
 
   // ===== Catálogo (whitelist) y snapshot para el LLM =====
   const ACTIONS_CATALOG: LLMActionsDoc = {
@@ -648,7 +925,7 @@ async function interpretAndDispatch(text: string) {
       { action: "add_to_cart" },
       { action: "set_global_discount" },
       { action: "set_customer" },
-      { action: "set_payment" },        // ← clave en FACTURA
+      { action: "set_payment" },
       { action: "confirm_document" },
       { action: "clear_cart" },
       { action: "repeat" },
@@ -781,6 +1058,25 @@ async function interpretAndDispatch(text: string) {
               </div>
             )}
 
+            {/* Botón conectar voz */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={async () => {
+                  try {
+                    await voice.connect();
+                    appendLog("✅ Voz conectada");
+                  } catch (e) {
+                    appendLog("✖ conectar voz: " + ((e as any)?.message ?? e));
+                  }
+                }}
+                disabled={voice.connected}
+                className="rounded-xl px-3 py-2 bg-blue-600 text-white"
+              >
+                {voice.connected ? "Voz conectada" : "Conectar voz"}
+              </button>
+              <audio id="assistantAudio" autoPlay playsInline />
+            </div>
+
             {/* Mic + prompt + confirmar */}
             <div className="flex items-center gap-2">
               <button
@@ -790,7 +1086,7 @@ async function interpretAndDispatch(text: string) {
               >
                 🎤 {micOn ? "ON" : "OFF"}
               </button>
-	      <input
+              <input
                 className="border rounded-xl px-3 py-2 w-80"
                 placeholder="Decí algo… ej: 'buscar caño 3/4', 'ítem 1', 'cantidad 3'"
                 onKeyDown={async (e) => {
@@ -800,22 +1096,20 @@ async function interpretAndDispatch(text: string) {
                     await interpretAndDispatch(v);
                   }
                 }}
-               />
+              />
               <button
                 className="rounded-xl px-4 py-2 bg-neutral-800 text-white"
                 onClick={async () => {
                   if (mode === "FACTURA" && !paymentSel.mop) {
-                    appendLog("Falta modo de pago → pido al LLM que lo seleccione y confirme…");
-                    await interpretAndDispatch("elegí un modo de pago y confirmá el documento");
+                    appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI)");
                     return;
                   }
-                  dispatchAction({ action: "confirm_document" });
+                  await dispatchAction({ action: "confirm_document" });
                 }}
-                disabled={loading || cart.length === 0}
+                
               >
                 {loading ? "Procesando…" : "Confirmar"}
               </button>
-
             </div>
           </div>
 
@@ -961,6 +1255,8 @@ async function interpretAndDispatch(text: string) {
               </table>
             </div>
 
+            
+            {/* Totales */}
             <div className="ml-auto text-sm">
               <div>
                 Neto: <span className="font-medium">{total.net.toFixed(2)} {docState.currency}</span>
@@ -972,39 +1268,46 @@ async function interpretAndDispatch(text: string) {
                 TOTAL: <span className="font-semibold">{total.grand.toFixed(2)} {docState.currency}</span>
               </div>
             </div>
-
+            
+            {/* Acciones */}
             <div className="flex items-center gap-2">
               <button
-                className="rounded-xl px-4 py-2 bg-neutral-800 text-white"
+                className="rounded-xl px-4 py-2 bg-neutral-800 text-white disabled:opacity-50"
+                disabled={loading || cart.length === 0}
                 onClick={async () => {
                   if (mode === "FACTURA" && !paymentSel.mop) {
-                    appendLog("Falta modo de pago → pido al LLM que lo seleccione y confirme…");
-                    await interpretAndDispatch("elegí un modo de pago y confirmá el documento");
+                    appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI)");
                     return;
                   }
-                  dispatchAction({ action: "confirm_document" });
+                  await dispatchAction({ action: "confirm_document" });
                 }}
-                disabled={loading || cart.length === 0}
               >
                 {loading ? "Procesando…" : "Confirmar"}
               </button>
-
-              <button className="rounded-xl px-4 py-2 bg-neutral-200">Imprimir</button>
+            
+              <button
+                className="rounded-xl px-4 py-2 bg-neutral-200 text-neutral-900"
+                onClick={() => window.print?.()}
+              >
+                Imprimir
+              </button>
             </div>
-          </div>
+            
+            
+                         
 
-          {/* Consola */}
-          <div className="col-span-2 bg-white/80 backdrop-blur rounded-2xl shadow p-3">
-            <div className="text-sm font-semibold mb-2">Consola</div>
-            <pre className="text-xs whitespace-pre-wrap max-h-48 overflow-auto border rounded-xl p-3 bg-neutral-50">
+{/* Consola */}
+<div className="col-span-2 bg-white/80 backdrop-blur rounded-2xl shadow p-3">
+  <div className="text-sm font-semibold mb-2">Consola</div>
+  <pre className="text-xs whitespace-pre-wrap max-h-48 overflow-auto border rounded-xl p-3 bg-neutral-50">
 {ACTIONS_DOC}
-
+{"\n"}
 {log.map((l) => `• ${l}`).join("\n")}
-            </pre>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
+  </pre>
+</div>
+</div>
+</div>
+</div>
+</div>
+);
 }
-
