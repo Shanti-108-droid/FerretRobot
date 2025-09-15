@@ -179,6 +179,19 @@ export default function App() {
   const resultsRef = useRef<SearchResult[]>([]);
   useEffect(() => { resultsRef.current = results; }, [results]);
 
+  // === Refs de snapshot para evitar stale state en confirmaciones encadenadas ===
+  const modeRef = useRef(mode);
+  const customerRef = useRef(customer);
+  const discountPctRef = useRef(discountPct);
+  const cartRef = useRef(cart);
+  const paymentSelRef = useRef(paymentSel);
+
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { customerRef.current = customer; }, [customer]);
+  useEffect(() => { discountPctRef.current = discountPct; }, [discountPct]);
+  useEffect(() => { cartRef.current = cart; }, [cart]);
+  useEffect(() => { paymentSelRef.current = paymentSel; }, [paymentSel]);
+
   // --- API: detalle de ítem (debe estar dentro del componente App)
   async function apiGetItemDetail(res: SearchResult, qOverride?: number): Promise<CartLine | null> {
     setLoading(true);
@@ -334,28 +347,40 @@ export default function App() {
 
   // ===== Confirmación =====
   function buildConfirmPayload() {
-    const items = cart.map((c) => ({
+    // Snapshot consistente tomado de refs
+    const modeSnap = modeRef.current;
+    const customerSnap = customerRef.current;
+    const discountSnap = discountPctRef.current || 0;
+    const cartSnap = cartRef.current || [];
+    const paymentSnap = paymentSelRef.current || {};
+
+    const items = cartSnap.map((c) => ({
       item_code: c.item_code,
       qty: c.qty,
       uom: c.uom,
       price_list_rate: c.unit_price,
     }));
 
+    // Calcular total/grand a partir del snapshot del carrito (consistente con discountSnap)
+    const netSnap = cartSnap.reduce((s, r) => s + r.subtotal, 0);
+    const discSnap = discountSnap > 0 ? netSnap * (discountSnap / 100) : 0;
+    const grandSnap = Math.max(0, netSnap - discSnap);
+
     const payments =
-      mode === "FACTURA" && paymentSel.mop
+      modeSnap === "FACTURA" && paymentSnap.mop
         ? [
             {
-              mode_of_payment: normalizeMop(paymentSel.mop) ?? paymentSel.mop,
-              account: paymentSel.account ?? null,
-              amount: total.grand,
+              mode_of_payment: normalizeMop(paymentSnap.mop) ?? paymentSnap.mop,
+              account: paymentSnap.account ?? null,
+              amount: grandSnap,
             },
           ]
         : undefined;
 
     const payload: any = {
-      mode,
-      customer,
-      discount_pct: discountPct,
+      mode: modeSnap,
+      customer: customerSnap,
+      discount_pct: discountSnap,
       items,
     };
     if (payments) payload.payments = payments;
@@ -366,10 +391,12 @@ export default function App() {
   async function apiConfirmDocument(): Promise<{ ok: boolean; number?: string }> {
     setLoading(true);
     try {
-      // Guardrail: en FACTURA exigimos un modo de pago seleccionado
-      if (mode === "FACTURA" && !paymentSel?.mop) {
-        appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI')");
-        return { ok: false };
+      // Guardrail mejorado: si estamos en FACTURA y no hay MOP, asumimos "Cash" por defecto
+      if (modeRef.current === "FACTURA" && !paymentSelRef.current?.mop) {
+        appendLog("⚠ no había método de pago, uso 'Cash' por defecto.");
+        setPaymentSel({ mop: "Cash", account: undefined });
+        // Actualizamos el ref inmediatamente para que el snapshot lo tome
+        paymentSelRef.current = { mop: "Cash", account: undefined };
       }
 
       const payload = buildConfirmPayload();
@@ -481,6 +508,31 @@ export default function App() {
       const data = await r.json();
       const actions = Array.isArray(data?.actions) ? data.actions : [];
       console.log("→ interpret actions", JSON.stringify(actions, null, 2));
+      // --- SAFE CONFIRM GUARD ---
+      // Solo permitimos 'confirm_document' si el texto del usuario realmente lo pide.
+      const confirmRegex =
+        /\b(confirm(ar|o|ado|ame|emos)?|factur(a|á|ar)|emit(ir|í) (la )?(factura|comprobante)|cerr(a|ar) venta)\b/i;
+
+      const userAskedToConfirm = confirmRegex.test(text);
+
+      // Si el usuario NO pidió confirmar, filtramos cualquier confirm_document que haya sugerido el planner
+      const safeActions = userAskedToConfirm
+        ? actions
+        : actions.filter(a => a.action !== "confirm_document");
+
+      if (!userAskedToConfirm && actions.some(a => a.action === "confirm_document")) {
+        appendLog("🔒 confirmación bloqueada: falta pedido explícito (decí 'confirmar').");
+      }
+
+      // A partir de acá, ejecutamos safeActions en lugar de actions
+      if (safeActions.length === 0) {
+        appendLog("interpret → sin acciones");
+        return;
+      }
+      for (const a of safeActions) {
+        await dispatchAction(a);
+      }
+
 
       if (actions.length === 0) {
         appendLog("interpret → sin acciones");
@@ -632,11 +684,17 @@ export default function App() {
       }
 
       case "confirm_document": {
-        const res = await apiConfirmDocument();
-        if (res.ok) {
-          appendLog(`✔ confirmado (${res.number}) total: ${total.grand.toFixed(2)} ${docState.currency}`);
-          setCart([]); setDiscountPct(0); setQty(1); qtyRef.current = 1;
-        } else {
+        try {
+          // Microespera para permitir asentar setStates previos en cadenas del planner
+          await new Promise((r) => setTimeout(r, 0));
+          const res = await apiConfirmDocument();
+          if (res.ok) {
+            appendLog(`✔ confirmado (${res.number}) total: ${total.grand.toFixed(2)} ${docState.currency}`);
+            setCart([]); setDiscountPct(0); setQty(1); qtyRef.current = 1;
+          } else {
+            appendLog("✖ error al confirmar");
+          }
+        } catch {
           appendLog("✖ error al confirmar");
         }
         break;
@@ -676,6 +734,31 @@ export default function App() {
       const norm = lower.replace(/\bpor\b/g, " x ").replace(/\s+/g, " ").trim();
 
       appendLog(`🎙️ usuario: ${text}`);
+
+      // === Confirmar directo por voz (fallback local) ===
+      // Cubre "confirmar", "confirmado", "confirmo", etc., aunque el planner no mande acciones.
+      if (/\bconfirm\w*\b/i.test(norm)) {
+        if (mode === "FACTURA" && !paymentSel.mop) {
+          await dispatchAction({ action: "set_payment", params: { mop: "Cash" } });
+        }
+        await dispatchAction({ action: "confirm_document" });
+        return;
+      }
+
+      // === "pago <método>" (efectivo, transferencia, tarjeta, etc.) ===
+      const mPago = norm.match(/^pago\s+(.+)$/i);
+      if (mPago) {
+        const mopRaw = mPago[1].trim();
+        const mop = normalizeMop(mopRaw) ?? mopRaw;
+        await dispatchAction({ action: "set_payment", params: { mop } });
+        return;
+      }
+      // También aceptamos el método solo (una palabra) como atajo, si estamos en FACTURA
+      if (mode === "FACTURA" && /^(efectivo|cash|transferencia|tarjeta(?:\s+(?:credito|crédito|debito|débito))?)$/i.test(norm)) {
+        const mop = normalizeMop(norm) ?? norm;
+        await dispatchAction({ action: "set_payment", params: { mop } });
+        return;
+      }
 
       // 1) Planner primero
       try {
@@ -1004,7 +1087,7 @@ export default function App() {
                 className="rounded-xl px-4 py-2 bg-neutral-800 text-white"
                 onClick={async () => {
                   if (mode === "FACTURA" && !paymentSel.mop) {
-                    appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI)");
+                    appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI')");
                     return;
                   }
                   await dispatchAction({ action: "confirm_document" });
@@ -1177,7 +1260,7 @@ export default function App() {
                 disabled={loading || cart.length === 0}
                 onClick={async () => {
                   if (mode === "FACTURA" && !paymentSel.mop) {
-                    appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI)");
+                    appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI')");
                     return;
                   }
                   await dispatchAction({ action: "confirm_document" });
