@@ -166,8 +166,13 @@ export default function App() {
   const [qtyPer, setQtyPer] = useState<Record<string, number>>({});
   const [cart, setCart] = useState<CartLine[]>([]);
   const [log, setLog] = useState<string[]>([]);
-  const [micOn, setMicOn] = useState<boolean>(false);
+  const [listening, setListening] = useState(false);
+  const lastSpaceDownRef = useRef<number>(0);
+  
   const [loading, setLoading] = useState<boolean>(false);
+    // Anti-duplicado de voz: evita procesar el MISMO texto más de una vez en ~1.5s
+  const recentVoiceRef = useRef<{ text: string; t: number }[]>([]);
+
 
   // Pagos
   const [paymentMethods, setPaymentMethods] = useState<
@@ -512,35 +517,24 @@ export default function App() {
       // Solo permitimos 'confirm_document' si el texto del usuario realmente lo pide.
       const confirmRegex =
         /\b(confirm(ar|o|ado|ame|emos)?|factur(a|á|ar)|emit(ir|í) (la )?(factura|comprobante)|cerr(a|ar) venta)\b/i;
-
+      
       const userAskedToConfirm = confirmRegex.test(text);
-
+      
       // Si el usuario NO pidió confirmar, filtramos cualquier confirm_document que haya sugerido el planner
       const safeActions = userAskedToConfirm
         ? actions
         : actions.filter(a => a.action !== "confirm_document");
-
+      
       if (!userAskedToConfirm && actions.some(a => a.action === "confirm_document")) {
         appendLog("🔒 confirmación bloqueada: falta pedido explícito (decí 'confirmar').");
       }
-
-      // A partir de acá, ejecutamos safeActions en lugar de actions
+      // Ejecutamos SOLO las acciones seguras (filtradas) en lote coherente
       if (safeActions.length === 0) {
         appendLog("interpret → sin acciones");
         return;
       }
-      for (const a of safeActions) {
-        await dispatchAction(a);
-      }
-
-
-      if (actions.length === 0) {
-        appendLog("interpret → sin acciones");
-        return;
-      }
-      for (const a of actions) {
-        await dispatchAction(a);
-      }
+      await dispatchActionsBatch(safeActions);
+      
     } catch (e: any) {
       appendLog(`✖ interpret falló: ${e?.message ?? e}`);
     }
@@ -548,6 +542,37 @@ export default function App() {
 
   // ===== Dispatcher (ÚNICO) =====
   type Action = { action: string; params?: Record<string, any> };
+  // Ejecuta un lote coherente: aplica select/set antes, y hace UNA sola add_to_cart al final
+  async function dispatchActionsBatch(actions: Action[]) {
+    if (!Array.isArray(actions) || actions.length === 0) return;
+  
+    // 1) Detectamos si hay pedido de alta
+    const addActions = actions.filter(a => a.action === "add_to_cart");
+    const hasAdd = addActions.length > 0;
+  
+    // 2) Ejecutamos todas las NO-add primero, en orden
+    for (const a of actions) {
+      if (a.action === "add_to_cart") continue;
+      await dispatchAction(a);
+    }
+  
+    // 3) Si había add_to_cart, lo consolidamos en UNA sola
+    if (hasAdd) {
+      // Tomamos índice preferente: el último select_index del lote, o el primero que venga en add_to_cart
+      let idxFromSelect: number | null = null;
+      for (const a of actions) {
+        if (a.action === "select_index") {
+          const idx1 = Number(a.params?.index ?? 0);
+          if (Number.isInteger(idx1) && idx1 > 0) idxFromSelect = idx1;
+        }
+      }
+      const idxFromAdd = Number(addActions[0]?.params?.index ?? 0) || null;
+  
+      const indexToUse = idxFromSelect || idxFromAdd || undefined;
+      await dispatchAction({ action: "add_to_cart", params: indexToUse ? { index: indexToUse } : {} });
+    }
+  }
+  
 
   async function dispatchAction(a: Action) {
     switch (a.action) {
@@ -730,6 +755,20 @@ export default function App() {
       };
 
       let text = (raw || "").trim();
+            // Dedupe por texto idéntico en ventana corta (1.5s)
+      {
+        const now = Date.now();
+        const arr = recentVoiceRef.current;
+        // limpiamos viejos (> 3s)
+        while (arr.length && now - arr[0].t > 3000) arr.shift();
+        const already = arr.findLast?.(x => x.text === text) || arr.slice().reverse().find(x => x.text === text);
+        if (already && (now - already.t) < 1500) {
+          appendLog("⏩ ignorado duplicado de voz (texto repetido)");
+          return;
+        }
+        arr.push({ text, t: now });
+      }
+
       const lower = text.toLowerCase().replace(/[.!?]\s*$/g, "");
       const norm = lower.replace(/\bpor\b/g, " x ").replace(/\s+/g, " ").trim();
 
