@@ -65,15 +65,15 @@ type DocumentState = {
 
 // ===== Pagos: normalización =====
 const MOP_MAP: Record<string, string> = {
-  "efectivo": "Cash",
-  "cash": "Cash",
-  "tarjeta": "Credit Card",
+  efectivo: "Cash",
+  cash: "Cash",
+  tarjeta: "Credit Card",
   "tarjeta credito": "Credit Card",
   "tarjeta crédito": "Credit Card",
   "tarjeta debito": "Debit Card",
   "tarjeta débito": "Debit Card",
-  "transferencia": "Bank Draft",
-  "banco": "Bank Draft",
+  transferencia: "Bank Draft",
+  banco: "Bank Draft",
 };
 function normalizeMop(input?: string): string | null {
   if (!input) return null;
@@ -151,7 +151,9 @@ function highlightText(text: string, terms: string[] | undefined) {
 export default function App() {
   // Estado
   const resumenRef = useRef<string[]>([]);
-  const pushResumen = (s: string) => { if (s) resumenRef.current.push(s); };
+  const pushResumen = (s: string) => {
+    if (s) resumenRef.current.push(s);
+  };
   const [mode, setMode] = useState<Mode>("PRESUPUESTO");
   const [customer, setCustomer] = useState<string>("Consumidor Final");
   const [discountPct, setDiscountPct] = useState<number>(0);
@@ -168,11 +170,10 @@ export default function App() {
   const [log, setLog] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
   const lastSpaceDownRef = useRef<number>(0);
-  
-  const [loading, setLoading] = useState<boolean>(false);
-    // Anti-duplicado de voz: evita procesar el MISMO texto más de una vez en ~1.5s
-  const recentVoiceRef = useRef<{ text: string; t: number }[]>([]);
 
+  const [loading, setLoading] = useState<boolean>(false);
+  // Anti-duplicado de voz: evita procesar el MISMO texto más de una vez en ~1.5s
+  const recentVoiceRef = useRef<{ text: string; t: number }[]>([]);
 
   // Pagos
   const [paymentMethods, setPaymentMethods] = useState<
@@ -182,7 +183,9 @@ export default function App() {
 
   // resultsRef para voz/planner
   const resultsRef = useRef<SearchResult[]>([]);
-  useEffect(() => { resultsRef.current = results; }, [results]);
+  useEffect(() => {
+    resultsRef.current = results;
+  }, [results]);
 
   // === Refs de snapshot para evitar stale state en confirmaciones encadenadas ===
   const modeRef = useRef(mode);
@@ -191,11 +194,21 @@ export default function App() {
   const cartRef = useRef(cart);
   const paymentSelRef = useRef(paymentSel);
 
-  useEffect(() => { modeRef.current = mode; }, [mode]);
-  useEffect(() => { customerRef.current = customer; }, [customer]);
-  useEffect(() => { discountPctRef.current = discountPct; }, [discountPct]);
-  useEffect(() => { cartRef.current = cart; }, [cart]);
-  useEffect(() => { paymentSelRef.current = paymentSel; }, [paymentSel]);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+  useEffect(() => {
+    customerRef.current = customer;
+  }, [customer]);
+  useEffect(() => {
+    discountPctRef.current = discountPct;
+  }, [discountPct]);
+  useEffect(() => {
+    cartRef.current = cart;
+  }, [cart]);
+  useEffect(() => {
+    paymentSelRef.current = paymentSel;
+  }, [paymentSel]);
 
   // --- API: detalle de ítem (debe estar dentro del componente App)
   async function apiGetItemDetail(res: SearchResult, qOverride?: number): Promise<CartLine | null> {
@@ -298,7 +311,7 @@ export default function App() {
       const isMatch = (it: SearchResult) => {
         if (toks.length === 0) return true;
         const nName = normalizeTextFront(it.item_name || "");
-        const nCode = normalizeTextFront(it.item_code || "");
+               const nCode = normalizeTextFront(it.item_code || "");
         const nDesc = normalizeTextFront(it.description || "");
         return toks.every((t) => nName.includes(t) || nCode.includes(t) || nDesc.includes(t));
       };
@@ -415,14 +428,20 @@ export default function App() {
 
       if (!r.ok) {
         let rawText = "";
-        try { rawText = await r.text(); } catch {}
+        try {
+          rawText = await r.text();
+        } catch {}
         let parsed: any = null;
-        try { parsed = rawText ? JSON.parse(rawText) : null; } catch {}
+        try {
+          parsed = rawText ? JSON.parse(rawText) : null;
+        } catch {}
 
         if (r.status === 400) {
           const detail = parsed?.detail ?? parsed ?? rawText;
           let detailObj: any = null;
-          try { detailObj = typeof detail === "string" ? JSON.parse(detail) : detail; } catch {}
+          try {
+            detailObj = typeof detail === "string" ? JSON.parse(detail) : detail;
+          } catch {}
           if (detailObj?.code === "PAYMENT_REQUIRED") {
             setPaymentMethods(Array.isArray(detailObj.payment_methods) ? detailObj.payment_methods : []);
             appendLog("Elegí un modo de pago y volvé a confirmar.");
@@ -451,7 +470,7 @@ export default function App() {
     try {
       const resultsSnapshot =
         (backendItems && backendItems.length
-          ? backendItems.map(bi => ({
+          ? backendItems.map((bi) => ({
               index: bi.index,
               item_code: bi.code,
               item_name: bi.name,
@@ -471,7 +490,7 @@ export default function App() {
           grand: total.grand,
           currency: docState.currency,
         },
-        cart: cart.map(c => ({
+        cart: cart.map((c) => ({
           item_code: c.item_code,
           qty: c.qty,
           uom: c.uom,
@@ -480,15 +499,24 @@ export default function App() {
         results: resultsSnapshot,
         selected_index: selectedIndex,
         qty_hint: qty,
-        payment: (mode === "FACTURA" && paymentSel.mop)
-          ? { mop: paymentSel.mop, account: paymentSel.account || undefined }
-          : undefined,
+        payment:
+          mode === "FACTURA" && paymentSel.mop
+            ? { mop: paymentSel.mop, account: paymentSel.account || undefined }
+            : undefined,
       };
 
       const catalogList = [
-        "set_mode","search","select_index","set_qty","add_to_cart",
-        "set_global_discount","set_customer","set_payment",
-        "confirm_document","clear_cart","repeat",
+        "set_mode",
+        "search",
+        "select_index",
+        "set_qty",
+        "add_to_cart",
+        "set_global_discount",
+        "set_customer",
+        "set_payment",
+        "confirm_document",
+        "clear_cart",
+        "repeat",
       ];
 
       // Snapshot fresco para planner + anti-race básico
@@ -517,15 +545,13 @@ export default function App() {
       // Solo permitimos 'confirm_document' si el texto del usuario realmente lo pide.
       const confirmRegex =
         /\b(confirm(ar|o|ado|ame|emos)?|factur(a|á|ar)|emit(ir|í) (la )?(factura|comprobante)|cerr(a|ar) venta)\b/i;
-      
+
       const userAskedToConfirm = confirmRegex.test(text);
-      
+
       // Si el usuario NO pidió confirmar, filtramos cualquier confirm_document que haya sugerido el planner
-      const safeActions = userAskedToConfirm
-        ? actions
-        : actions.filter(a => a.action !== "confirm_document");
-      
-      if (!userAskedToConfirm && actions.some(a => a.action === "confirm_document")) {
+      const safeActions = userAskedToConfirm ? actions : actions.filter((a) => a.action !== "confirm_document");
+
+      if (!userAskedToConfirm && actions.some((a) => a.action === "confirm_document")) {
         appendLog("🔒 confirmación bloqueada: falta pedido explícito (decí 'confirmar').");
       }
       // Ejecutamos SOLO las acciones seguras (filtradas) en lote coherente
@@ -534,7 +560,6 @@ export default function App() {
         return;
       }
       await dispatchActionsBatch(safeActions);
-      
     } catch (e: any) {
       appendLog(`✖ interpret falló: ${e?.message ?? e}`);
     }
@@ -545,20 +570,16 @@ export default function App() {
   // Ejecuta un lote coherente: aplica select/set antes, y hace UNA sola add_to_cart al final
   async function dispatchActionsBatch(actions: Action[]) {
     if (!Array.isArray(actions) || actions.length === 0) return;
-  
-    // 1) Detectamos si hay pedido de alta
-    const addActions = actions.filter(a => a.action === "add_to_cart");
+
+    const addActions = actions.filter((a) => a.action === "add_to_cart");
     const hasAdd = addActions.length > 0;
-  
-    // 2) Ejecutamos todas las NO-add primero, en orden
+
     for (const a of actions) {
       if (a.action === "add_to_cart") continue;
       await dispatchAction(a);
     }
-  
-    // 3) Si había add_to_cart, lo consolidamos en UNA sola
+
     if (hasAdd) {
-      // Tomamos índice preferente: el último select_index del lote, o el primero que venga en add_to_cart
       let idxFromSelect: number | null = null;
       for (const a of actions) {
         if (a.action === "select_index") {
@@ -567,12 +588,11 @@ export default function App() {
         }
       }
       const idxFromAdd = Number(addActions[0]?.params?.index ?? 0) || null;
-  
+
       const indexToUse = idxFromSelect || idxFromAdd || undefined;
       await dispatchAction({ action: "add_to_cart", params: indexToUse ? { index: indexToUse } : {} });
     }
   }
-  
 
   async function dispatchAction(a: Action) {
     switch (a.action) {
@@ -591,7 +611,10 @@ export default function App() {
 
       case "set_payment": {
         const mopRaw = (a.params?.mop ?? "").toString().trim();
-        if (!mopRaw) { appendLog("set_payment: faltan parámetros (mop)."); break; }
+        if (!mopRaw) {
+          appendLog("set_payment: faltan parámetros (mop).");
+          break;
+        }
         const mop = normalizeMop(mopRaw) ?? mopRaw;
         const account = (a.params?.account ?? "").toString().trim() || undefined;
         if (!paymentMethods.length) await loadPaymentMethods();
@@ -652,14 +675,20 @@ export default function App() {
         const list = resultsRef.current ?? results;
         const idxParam1 = Number(a.params?.index ?? 0);
         const idx1 = idxParam1 >= 1 ? idxParam1 : Number(selectedIndexRef?.current ?? 0);
-        if (!list || !list.length) { appendLog("no hay resultados (list vacía)"); break; }
+        if (!list || !list.length) {
+          appendLog("no hay resultados (list vacía)");
+          break;
+        }
         if (!idx1 || idx1 < 1 || idx1 > list.length) {
           appendLog(`no hay selección (list_len=${list.length}, sel=${idx1 || 0})`);
           break;
         }
         const res = list[idx1 - 1];
         const qEff = Number(qtyPer[res.item_code] ?? qtyRef.current ?? qty ?? 1);
-        if (!Number.isFinite(qEff) || qEff <= 0) { appendLog("cantidad inválida (falta set_qty)"); break; }
+        if (!Number.isFinite(qEff) || qEff <= 0) {
+          appendLog("cantidad inválida (falta set_qty)");
+          break;
+        }
 
         // anti-duplicado si la voz dispara dos add_to_cart iguales en <500ms
         const key = `${res.item_code}|${qEff}`;
@@ -704,7 +733,10 @@ export default function App() {
 
       case "set_customer": {
         const name = (a.params?.name ?? "").toString().trim();
-        if (name) { setCustomer(name); appendLog(`cliente → ${name}`); }
+        if (name) {
+          setCustomer(name);
+          appendLog(`cliente → ${name}`);
+        }
         break;
       }
 
@@ -715,7 +747,10 @@ export default function App() {
           const res = await apiConfirmDocument();
           if (res.ok) {
             appendLog(`✔ confirmado (${res.number}) total: ${total.grand.toFixed(2)} ${docState.currency}`);
-            setCart([]); setDiscountPct(0); setQty(1); qtyRef.current = 1;
+            setCart([]);
+            setDiscountPct(0);
+            setQty(1);
+            qtyRef.current = 1;
           } else {
             appendLog("✖ error al confirmar");
           }
@@ -726,13 +761,20 @@ export default function App() {
       }
 
       case "clear_cart": {
-        setCart([]); setDiscountPct(0); setQty(1); qtyRef.current = 1;
+        setCart([]);
+        setDiscountPct(0);
+        setQty(1);
+        qtyRef.current = 1;
         appendLog("carrito vacío");
         break;
       }
 
       case "repeat": {
-        appendLog(`TOTAL → neto ${total.net.toFixed(2)} desc ${total.discount.toFixed(2)} = ${total.grand.toFixed(2)} ${docState.currency}`);
+        appendLog(
+          `TOTAL → neto ${total.net.toFixed(2)} desc ${total.discount.toFixed(2)} = ${total.grand.toFixed(
+            2
+          )} ${docState.currency}`
+        );
         break;
       }
 
@@ -741,201 +783,275 @@ export default function App() {
     }
   }
 
-  // ===== VOZ (hook)
-  const voice = useRealtimeVoice({
-    bridgeBase: BRIDGE_BASE,
-    onUserText: async (raw) => {
-      const waitUntilResults = async (timeoutMs = 3000) => {
-        const t0 = Date.now();
-        while (Date.now() - t0 < timeoutMs) {
-          if (resultsRef.current.length > 0) return true;
-          await new Promise((r) => setTimeout(r, 60));
-        }
-        return resultsRef.current.length > 0;
-      };
+// ===== VOZ (hook)
+const voice = useRealtimeVoice({
+  bridgeBase: BRIDGE_BASE,
 
-      let text = (raw || "").trim();
-            // Dedupe por texto idéntico en ventana corta (1.5s)
-      {
-        const now = Date.now();
-        const arr = recentVoiceRef.current;
-        // limpiamos viejos (> 3s)
-        while (arr.length && now - arr[0].t > 3000) arr.shift();
-        const already = arr.findLast?.(x => x.text === text) || arr.slice().reverse().find(x => x.text === text);
-        if (already && (now - already.t) < 1500) {
-          appendLog("⏩ ignorado duplicado de voz (texto repetido)");
-          return;
-        }
-        arr.push({ text, t: now });
+  onUserText: async (raw) => {
+    const waitUntilResults = async (timeoutMs = 3000) => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeoutMs) {
+        if (resultsRef.current.length > 0) return true;
+        await new Promise((r) => setTimeout(r, 60));
       }
+      return resultsRef.current.length > 0;
+    };
 
-      const lower = text.toLowerCase().replace(/[.!?]\s*$/g, "");
-      const norm = lower.replace(/\bpor\b/g, " x ").replace(/\s+/g, " ").trim();
-
-      appendLog(`🎙️ usuario: ${text}`);
-
-      // === Confirmar directo por voz (fallback local) ===
-      // Cubre "confirmar", "confirmado", "confirmo", etc., aunque el planner no mande acciones.
-      if (/\bconfirm\w*\b/i.test(norm)) {
-        if (mode === "FACTURA" && !paymentSel.mop) {
-          await dispatchAction({ action: "set_payment", params: { mop: "Cash" } });
-        }
-        await dispatchAction({ action: "confirm_document" });
+    let text = (raw || "").trim();
+    {
+      const now = Date.now();
+      const arr = recentVoiceRef.current;
+      while (arr.length && now - arr[0].t > 3000) arr.shift();
+      const already =
+        (arr as any).findLast?.((x: any) => x.text === text) ||
+        arr.slice().reverse().find((x) => x.text === text);
+      if (already && now - (already as any).t < 1500) {
+        appendLog("⏩ ignorado duplicado de voz (texto repetido)");
         return;
       }
+      arr.push({ text, t: now });
+    }
 
-      // === "pago <método>" (efectivo, transferencia, tarjeta, etc.) ===
-      const mPago = norm.match(/^pago\s+(.+)$/i);
-      if (mPago) {
-        const mopRaw = mPago[1].trim();
-        const mop = normalizeMop(mopRaw) ?? mopRaw;
-        await dispatchAction({ action: "set_payment", params: { mop } });
-        return;
+    const lower = text.toLowerCase().replace(/[.!?]\s*$/g, "");
+    const norm = lower.replace(/\bpor\b/g, " x ").replace(/\s+/g, " ").trim();
+
+    appendLog(`🎙️ usuario: ${text}`);
+
+    // Confirmar directo
+    if (/\bconfirm\w*\b/i.test(norm)) {
+      if (mode === "FACTURA" && !paymentSel.mop) {
+        await dispatchAction({ action: "set_payment", params: { mop: "Cash" } });
       }
-      // También aceptamos el método solo (una palabra) como atajo, si estamos en FACTURA
-      if (mode === "FACTURA" && /^(efectivo|cash|transferencia|tarjeta(?:\s+(?:credito|crédito|debito|débito))?)$/i.test(norm)) {
-        const mop = normalizeMop(norm) ?? norm;
-        await dispatchAction({ action: "set_payment", params: { mop } });
-        return;
-      }
+      await dispatchAction({ action: "confirm_document" });
+      return;
+    }
 
-      // 1) Planner primero
-      try {
-        const resumen = await interpretAndDispatch(text);
-        if (resumen) voice.speak(resumen);
-        return;
-      } catch (e) {
-        const msg = (e as any)?.message ?? "Error procesando el pedido";
-        appendLog(`✖ voz→interpret: ${msg}`);
-        // seguimos con atajos locales
-      }
+    // "pago <método>"
+    const mPago = norm.match(/^pago\s+(.+)$/i);
+    if (mPago) {
+      const mopRaw = mPago[1].trim();
+      const mop = normalizeMop(mopRaw) ?? mopRaw;
+      await dispatchAction({ action: "set_payment", params: { mop } });
+      return;
+    }
+    if (
+      mode === "FACTURA" &&
+      /^(efectivo|cash|transferencia|tarjeta(?:\s+(?:credito|crédito|debito|débito))?)$/i.test(norm)
+    ) {
+      const mop = normalizeMop(norm) ?? norm;
+      await dispatchAction({ action: "set_payment", params: { mop } });
+      return;
+    }
 
-      // 2) Atajos locales (fallback)
+    // 1) Planner primero
+    try {
+      const resumen = await interpretAndDispatch(text);
+      if (resumen) (voice as any).speak(resumen);
+      return;
+    } catch (e) {
+      const msg = (e as any)?.message ?? "Error procesando el pedido";
+      appendLog(`✖ voz→interpret: ${msg}`);
+    }
 
-      // MODO
-      if (/^modo\s+(presupuesto|factura|remito)$/i.test(norm)) {
-        const m = norm.match(/^modo\s+(presupuesto|factura|remito)$/i)!;
-        const modo = m[1].toUpperCase();
-        await dispatchAction({ action: "set_mode", params: { mode: modo } });
-        voice.speak(`Modo ${m[1]}.`);
-        return;
-      }
+    // 2) Atajos locales (fallback)
 
-      // “Buscar <algo>”
-      const mBuscar = norm.match(/^(?:busca|buscar|buscá|buscame|buscáme)\s+(.+)$/i);
-      if (mBuscar) {
-        const term = mBuscar[1].trim();
-        await dispatchAction({ action: "search", params: { term } });
-        return;
-      }
+    // MODO
+    if (/^modo\s+(presupuesto|factura|remito)$/i.test(norm)) {
+      const m = norm.match(/^modo\s+(presupuesto|factura|remito)$/i)!;
+      const modo = m[1].toUpperCase();
+      await dispatchAction({ action: "set_mode", params: { mode: modo } });
+      (voice as any).speak(`Modo ${m[1]}.`);
+      return;
+    }
 
-      // Fallback 1 palabra → búsqueda
-      if (!/\s/.test(norm) && norm.length >= 2) {
-        await dispatchAction({ action: "search", params: { term: norm } });
-        return;
-      }
+    // “Buscar <algo>”
+    const mBuscar = norm.match(/^(?:busca|buscar|buscá|buscame|buscáme)\s+(.+)$/i);
+    if (mBuscar) {
+      const term = mBuscar[1].trim();
+      await dispatchAction({ action: "search", params: { term } });
+      return;
+    }
 
-      // “ítem N, cantidad Q”
-      const mSelQty = norm.match(/^(?:ítem|item)\s+(\d+)\s*,?\s*cantidad\s+(\d+)$/i);
-      if (mSelQty) {
-        const idx = Number(mSelQty[1]);
-        const q = Math.max(1, Number(mSelQty[2]));
-        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-          voice.speak("Decime primero qué buscar.");
-          return;
-        }
-        await dispatchAction({ action: "select_index", params: { index: idx } });
-        await dispatchAction({ action: "set_qty", params: { qty: q } });
-        return;
-      }
-
-      // “del ítem N agregar Q”
-      const mDelSelAdd = norm.match(/^del\s+(?:ítem|item)\s+(\d+)\s*,?\s*(?:agrega(?:r)?|sumar|añadir|poner)\s*(\d+)\s*(?:unidades?)?$/i);
-      if (mDelSelAdd) {
-        const idx = Number(mDelSelAdd[1]);
-        const q = Math.max(1, Number(mDelSelAdd[2]));
-        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-          voice.speak("Decime primero qué buscar.");
-          return;
-        }
-        await dispatchAction({ action: "select_index", params: { index: idx } });
-        await dispatchAction({ action: "set_qty", params: { qty: q } });
-        await dispatchAction({ action: "add_to_cart", params: { index: idx } });
-        voice.speak("Listo.");
-        return;
-      }
-
-      // “item N agregar Q”
-      const mSelAdd = norm.match(/^(?:ítem|item)\s+(\d+)\s*,?\s*(?:agrega(?:r)?|sumar|añadir|poner)\s*(\d+)?$/i);
-      if (mSelAdd) {
-        const idx = Number(mSelAdd[1]);
-        const qOpt = mSelAdd[2] ? Math.max(1, Number(mSelAdd[2])) : null;
-        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-          voice.speak("Decime primero qué buscar.");
-          return;
-        }
-        await dispatchAction({ action: "select_index", params: { index: idx } });
-        if (qOpt) await dispatchAction({ action: "set_qty", params: { qty: qOpt } });
-        await dispatchAction({ action: "add_to_cart", params: { index: idx } });
-        voice.speak("Listo.");
-        return;
-      }
-
-      // “agregar (el) ítem N (x|por|de Q)?”
-      const mAdd = norm.match(/^(?:agrega(?:r)?|sumar|añadir|poner)\s+(?:el\s+)?(?:ítem|item)\s+(\d+)(?:\s*(?:x|por|de)\s*(\d+))?$/i);
-      if (mAdd) {
-        const idx = Number(mAdd[1]);
-        const qOpt = mAdd[2] ? Math.max(1, Number(mAdd[2])) : null;
-        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-          voice.speak("Decime primero qué buscar.");
-          return;
-        }
-        await dispatchAction({ action: "select_index", params: { index: idx } });
-        if (qOpt) await dispatchAction({ action: "set_qty", params: { qty: qOpt } });
-        await dispatchAction({ action: "add_to_cart", params: { index: idx } });
-        voice.speak("Listo.");
-        return;
-      }
-
-      // “agregar ítem” (sin N)
-      if (/^(?:agrega(?:r)?|sumar|añadir|poner)\s+(?:el\s+)?(?:ítem|item)\b$/i.test(norm)) {
-        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-          voice.speak("Decime primero qué buscar.");
-          return;
-        }
-        const idx = selectedIndex ?? (resultsRef.current.length > 0 ? 1 : null);
-        if (!idx) { appendLog("no hay selección"); return; }
-        await dispatchAction({ action: "select_index", params: { index: idx } });
-        await dispatchAction({ action: "add_to_cart", params: { index: idx } });
-        voice.speak("Listo.");
-        return;
-      }
-
-      // “cantidad Q”
-      const mQty = norm.match(/^(?:cantidad|poner)\s+(\d+)$/i);
-      if (mQty) {
-        const q = Math.max(1, Number(mQty[1]));
-        await dispatchAction({ action: "set_qty", params: { qty: q } });
-        voice.speak(`Cantidad ${q}.`);
-        return;
-      }
-
-      // “ítem N” (selección directa)
-      const mSel = norm.match(/^(?:ítem|item)\s+(\d+)$/i);
-      if (mSel) {
-        const idx = Number(mSel[1]);
-        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-          voice.speak("Decime primero qué buscar.");
-          return;
-        }
-        await dispatchAction({ action: "select_index", params: { index: idx } });
-        return;
-      }
-
-      // Si nada matcheó y el planner falló, último fallback: buscar literal
+    // Fallback 1 palabra → búsqueda
+    if (!/\s/.test(norm) && norm.length >= 2) {
       await dispatchAction({ action: "search", params: { term: norm } });
-    },
-  });
+      return;
+    }
+
+    // “ítem N, cantidad Q”
+    const mSelQty = norm.match(/^(?:ítem|item)\s+(\d+)\s*,?\s*cantidad\s+(\d+)$/i);
+    if (mSelQty) {
+      const idx = Number(mSelQty[1]);
+      const q = Math.max(1, Number(mSelQty[2]));
+      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+        (voice as any).speak("Decime primero qué buscar.");
+        return;
+      }
+      await dispatchAction({ action: "select_index", params: { index: idx } });
+      await dispatchAction({ action: "set_qty", params: { qty: q } });
+      return;
+    }
+
+    // “del ítem N agregar Q”
+    const mDelSelAdd = norm.match(
+      /^del\s+(?:ítem|item)\s+(\d+)\s*,?\s*(?:agrega(?:r)?|sumar|añadir|poner)\s*(\d+)\s*(?:unidades?)?$/i
+    );
+    if (mDelSelAdd) {
+      const idx = Number(mDelSelAdd[1]);
+      const q = Math.max(1, Number(mDelSelAdd[2]));
+      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+        (voice as any).speak("Decime primero qué buscar.");
+        return;
+      }
+      await dispatchAction({ action: "select_index", params: { index: idx } });
+      await dispatchAction({ action: "set_qty", params: { qty: q } });
+      await dispatchAction({ action: "add_to_cart", params: { index: idx } });
+      (voice as any).speak("Listo.");
+      return;
+    }
+
+    // “item N agregar Q”
+    const mSelAdd = norm.match(/^(?:ítem|item)\s+(\d+)\s*,?\s*(?:agrega(?:r)?|sumar|añadir|poner)\s*(\d+)?$/i);
+    if (mSelAdd) {
+      const idx = Number(mSelAdd[1]);
+      const qOpt = mSelAdd[2] ? Math.max(1, Number(mSelAdd[2])) : null;
+      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+        (voice as any).speak("Decime primero qué buscar.");
+        return;
+      }
+      await dispatchAction({ action: "select_index", params: { index: idx } });
+      if (qOpt) await dispatchAction({ action: "set_qty", params: { qty: qOpt } });
+      await dispatchAction({ action: "add_to_cart", params: { index: idx } });
+      (voice as any).speak("Listo.");
+      return;
+    }
+
+    // “agregar (el) ítem N (x|por|de Q)?”
+    const mAdd = norm.match(
+      /^(?:agrega(?:r)?|sumar|añadir|poner)\s+(?:el\s+)?(?:ítem|item)\s+(\d+)(?:\s*(?:x|por|de)\s*(\d+))?$/i
+    );
+    if (mAdd) {
+      const idx = Number(mAdd[1]);
+      const qOpt = mAdd[2] ? Math.max(1, Number(mAdd[2])) : null;
+      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+        (voice as any).speak("Decime primero qué buscar.");
+        return;
+      }
+      await dispatchAction({ action: "select_index", params: { index: idx } });
+      if (qOpt) await dispatchAction({ action: "set_qty", params: { qty: qOpt } });
+      await dispatchAction({ action: "add_to_cart", params: { index: idx } });
+      (voice as any).speak("Listo.");
+      return;
+    }
+
+    // “agregar ítem” (sin N)
+    if (/^(?:agrega(?:r)?|sumar|añadir|poner)\s+(?:el\s+)?(?:ítem|item)\b$/i.test(norm)) {
+      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+        (voice as any).speak("Decime primero qué buscar.");
+        return;
+      }
+      const idx = selectedIndex ?? (resultsRef.current.length > 0 ? 1 : null);
+      if (!idx) {
+        appendLog("no hay selección");
+        return;
+      }
+      await dispatchAction({ action: "select_index", params: { index: idx } });
+      await dispatchAction({ action: "add_to_cart", params: { index: idx } });
+      (voice as any).speak("Listo.");
+      return;
+    }
+
+    // “cantidad Q”
+    const mQty = norm.match(/^(?:cantidad|poner)\s+(\d+)$/i);
+    if (mQty) {
+      const q = Math.max(1, Number(mQty[1]));
+      await dispatchAction({ action: "set_qty", params: { qty: q } });
+      (voice as any).speak(`Cantidad ${q}.`);
+      return;
+    }
+
+    // “ítem N” (selección directa)
+    const mSel = norm.match(/^(?:ítem|item)\s+(\d+)$/i);
+    if (mSel) {
+      const idx = Number(mSel[1]);
+      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+        (voice as any).speak("Decime primero qué buscar.");
+        return;
+      }
+      await dispatchAction({ action: "select_index", params: { index: idx } });
+      return;
+    }
+
+    // último fallback
+    await dispatchAction({ action: "search", params: { term: norm } });
+  },
+
+  // Opciones del hook
+  audioElId: "assistantAudio",
+  onListeningChange: (on: boolean) => { setListening(on); console.log("[voice] listening:", on); },
+  beeps: true,
+  pttMaxMs: 8000,
+  onError: (e: any) => appendLog(`⚠ voz: ${e?.message ?? e}`),
+});
+
+// Hotkeys globales: Space / Esc
+useEffect(() => {
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.code === "Space" && !e.repeat) {
+      e.preventDefault();
+      (voice as any).startListening?.();
+      (voice as any).pttDown?.();
+    } else if (e.code === "Escape") {
+      e.preventDefault();
+      (voice as any).stopListening?.();
+      (voice as any).cancelCurrentTurn?.();
+    }
+  };
+  const onKeyUp = (e: KeyboardEvent) => {
+    if (e.code === "Space") {
+      e.preventDefault();
+      if (!(voice as any).latch) {
+        (voice as any).stopListening?.();
+        (voice as any).pttUp?.();
+      }
+    }
+  };
+  window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("keyup", onKeyUp);
+  return () => {
+    window.removeEventListener("keydown", onKeyDown);
+    window.removeEventListener("keyup", onKeyUp);
+  };
+}, [voice]);
+
+// Helper opcional: latch + start
+const toggleLatchAndStart = () => {
+  try { (voice as any).toggleLatch?.(); } catch {}
+  setTimeout(() => {
+    try {
+      if ((voice as any).latch) {
+        (voice as any).startListening?.();
+        (voice as any).pttDown?.();
+        (voice as any).beginListening?.();
+      }
+    } catch {}
+  }, 0);
+};
+
+
+// === DEBUG: exponer y loguear 'voice' ===
+useEffect(() => {
+  // @ts-ignore
+  (window as any).voice = voice;
+  try {
+    const keys = Object.keys(voice || {});
+    console.log("[voice] objeto exportado:", keys);
+  } catch (e) {
+    console.log("[voice] no pude inspeccionar keys:", e);
+  }
+}, [voice]);
+
+
 
   // ===== Catálogo (whitelist) y snapshot para el LLM =====
   const ACTIONS_CATALOG: LLMActionsDoc = {
@@ -959,7 +1075,7 @@ export default function App() {
       mode,
       customer,
       total: { net: total.net, discount: total.discount, grand: total.grand, currency: docState.currency },
-      cart: cart.map(c => ({
+      cart: cart.map((c) => ({
         item_code: c.item_code,
         qty: c.qty,
         uom: c.uom,
@@ -968,8 +1084,8 @@ export default function App() {
     };
   }
 
-  // ===== UI =====
-  const ACTIONS_DOC = `
+// ===== UI =====
+const ACTIONS_DOC = `
 [CATALOGO_ACCIONES]
 - set_mode(mode)
 - search(term)
@@ -984,351 +1100,415 @@ export default function App() {
 - repeat()
 `;
 
-  return (
-    <div className="relative min-h-screen w-full text-neutral-900 bg-transparent">
-      <ArtPollock
-        density={140}
-        opacityRange={[0.25, 0.4]}
-        strokeRange={[1.5, 3]}
-        colors={["#E8D5FF", "#C7F2F0", "#FFE2B8", "#FFD6E0", "#DDE8FF"]}
-      />
-      <div className="relative z-10 p-4">
-        <div className="mx-auto max-w-6xl grid grid-cols-2 gap-4">
-          {/* Header */}
-          <div className="col-span-2 flex flex-wrap items-center justify-between gap-3 bg-white/80 backdrop-blur rounded-2xl shadow p-3">
-            {/* Modo */}
+return (
+  <div className="relative min-h-screen w-full text-neutral-900 bg-transparent">
+    <ArtPollock
+      density={140}
+      opacityRange={[0.25, 0.4]}
+      strokeRange={[1.5, 3]}
+      colors={["#E8D5FF", "#C7F2F0", "#FFE2B8", "#FFD6E0", "#DDE8FF"]}
+    />
+    <div className="relative z-10 p-4">
+      <div className="mx-auto max-w-6xl grid grid-cols-2 gap-4">
+        <div className="col-span-2 flex flex-wrap items-center justify-between gap-3 bg-white/80 backdrop-blur rounded-2xl shadow p-3">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium">Modo</span>
+            <select
+              className="border rounded-xl px-3 py-2"
+              value={mode}
+              onChange={(e) => dispatchAction({ action: "set_mode", params: { mode: e.target.value } })}
+            >
+              <option value="PRESUPUESTO">Presupuesto</option>
+              <option value="FACTURA">Factura</option>
+              <option value="REMITO">Remito</option>
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium">Cliente</span>
+            <CustomerPicker
+              value={customer}
+              bridgeBase={BRIDGE_BASE}
+              onSelect={(name) => dispatchAction({ action: "set_customer", params: { name } })}
+            />
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium">Desc. (%)</span>
+            <input
+              type="number"
+              className="border rounded-xl px-3 py-2 w-24"
+              value={discountPct}
+              min={0}
+              max={100}
+              onChange={(e) => dispatchAction({ action: "set_global_discount", params: { percent: Number(e.target.value) } })}
+            />
+          </div>
+
+          {mode === "FACTURA" && (
             <div className="flex items-center gap-2">
-              <span className="text-sm font-medium">Modo</span>
+              <span className="text-sm font-medium">Pago</span>
               <select
                 className="border rounded-xl px-3 py-2"
-                value={mode}
-                onChange={(e) =>
-                  dispatchAction({ action: "set_mode", params: { mode: e.target.value } })
-                }
+                value={paymentSel.mop || ""}
+                onChange={(e) => {
+                  const mopRaw = e.target.value || undefined;
+                  const mop = mopRaw ? (normalizeMop(mopRaw) ?? mopRaw) : undefined;
+                  const accs = mop ? (paymentMethods.find((m) => m.name === mop)?.accounts || []) : [];
+                  setPaymentSel({
+                    mop,
+                    account: accs && accs.length > 0 ? (accs[0]?.account || undefined) : undefined,
+                  });
+                }}
               >
-                <option value="PRESUPUESTO">Presupuesto</option>
-                <option value="FACTURA">Factura</option>
-                <option value="REMITO">Remito</option>
+                <option value="">Elegí un método…</option>
+                {paymentMethods.map((m) => (
+                  <option key={m.name} value={m.name}>
+                    {m.name}
+                  </option>
+                ))}
               </select>
-            </div>
-
-            {/* Cliente */}
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-medium">Cliente</span>
-              <CustomerPicker
-                value={customer}
-                bridgeBase={BRIDGE_BASE}
-                onSelect={(name) =>
-                  dispatchAction({ action: "set_customer", params: { name } })
-                }
-              />
-            </div>
-
-            {/* Descuento */}
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-medium">Desc. (%)</span>
-              <input
-                type="number"
-                className="border rounded-xl px-3 py-2 w-24"
-                value={discountPct}
-                min={0} max={100}
-                onChange={(e) =>
-                  dispatchAction({
-                    action: "set_global_discount",
-                    params: { percent: Number(e.target.value) },
-                  })
-                }
-              />
-            </div>
-
-            {/* Pago (solo FACTURA) */}
-            {mode === "FACTURA" && (
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-medium">Pago</span>
-                <select
-                  className="border rounded-xl px-3 py-2"
-                  value={paymentSel.mop || ""}
-                  onChange={(e) => {
-                    const mopRaw = e.target.value || undefined;
-                    const mop = mopRaw ? (normalizeMop(mopRaw) ?? mopRaw) : undefined;
-                    const accs = mop
-                      ? (paymentMethods.find((m) => m.name === mop)?.accounts || [])
-                      : [];
-                    setPaymentSel({
-                      mop,
-                      account: accs && accs.length > 0 ? (accs[0]?.account || undefined) : undefined,
-                    });
-                  }}
-                >
-                  <option value="">Elegí un método…</option>
-                  {paymentMethods.map((m) => (
-                    <option key={m.name} value={m.name}>{m.name}</option>
-                  ))}
-                </select>
-
-                {/* Si el método tiene cuentas configuradas, permitimos elegir una */}
-                {paymentSel.mop && (paymentMethods.find(m => m.name === paymentSel.mop)?.accounts?.length || 0) > 0 && (
+              {paymentSel.mop &&
+                (paymentMethods.find((m) => m.name === paymentSel.mop)?.accounts?.length || 0) > 0 && (
                   <select
                     className="border rounded-xl px-3 py-2"
                     value={paymentSel.account || ""}
                     onChange={(e) => setPaymentSel((prev) => ({ ...prev, account: e.target.value || undefined }))}
                   >
-                    {(paymentMethods.find(m => m.name === paymentSel.mop)?.accounts || []).map((a, i) => (
+                    {(paymentMethods.find((m) => m.name === paymentSel.mop)?.accounts || []).map((a, i) => (
                       <option key={`${a.account}-${i}`} value={a.account || ""}>
                         {a.account || "(sin cuenta)"}
                       </option>
                     ))}
                   </select>
                 )}
-              </div>
-            )}
-
-            {/* Botón conectar voz */}
-            <div className="flex items-center gap-2">
-              <button
-                onClick={async () => {
-                  try {
-                    await voice.connect();
-                    appendLog("✅ Voz conectada");
-                  } catch (e) {
-                    appendLog("✖ conectar voz: " + ((e as any)?.message ?? e));
-                  }
-                }}
-                disabled={voice.connected}
-                className="rounded-xl px-3 py-2 bg-blue-600 text-white"
-              >
-                {voice.connected ? "Voz conectada" : "Conectar voz"}
-              </button>
-              <audio id="assistantAudio" autoPlay playsInline />
             </div>
+          )}
 
-            {/* Mic + prompt + confirmar */}
-            <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={async () => {
+                try {
+                  // Pide permiso de mic explícitamente (ayuda con permisos en Opera/Chrome)
+                  try {
+                    await navigator.mediaDevices.getUserMedia({ audio: true });
+                  } catch {
+                    appendLog("⚠ permiso de mic denegado o falló");
+                  }
+          
+                  await (voice as any).connect();
+                  appendLog("✅ Voz conectada");
+          
+                  // Adjuntar el <audio> de salida
+                  const el = document.getElementById("assistantAudio") as HTMLAudioElement | null;
+                  if (el) {
+                    (voice as any).attachAudioElement?.(el);
+                    (voice as any).setAudioElement?.(el);
+                    appendLog("🔊 audio de asistente adjuntado");
+                  } else {
+                    appendLog("⚠ no encontré <audio id='assistantAudio'> en el DOM");
+                  }
+                } catch (e) {
+                  appendLog("✖ conectar voz: " + ((e as any)?.message ?? e));
+                }
+              }}
+              disabled={(voice as any).connected}
+              className="rounded-xl px-3 py-2 bg-blue-600 text-white"
+            >
+              {(voice as any).connected ? "Voz conectada" : "Conectar voz"}
+            </button>
+          
+            {/* ⬇️ ESTE elemento es clave */}
+            <audio id="assistantAudio" autoPlay playsInline />
+          
+            {/* Indicador de escucha */}
+            <div
+              className={`ml-2 w-2 h-2 rounded-full ${
+                listening ? "bg-red-500 animate-pulse" : "bg-neutral-300"
+              }`}
+              title={listening ? "Escuchando" : "Silencio"}
+            />
+          </div>
+          
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              className={`rounded-xl px-3 py-2 ${listening ? "bg-green-600 text-white" : "bg-neutral-200"}`}
+              onMouseDown={() => {
+                (voice as any).startListening?.();
+                (voice as any).pttDown?.();
+                (voice as any).beginListening?.();
+              }}
+              onMouseUp={() => {
+                if (!(voice as any).latch) {
+                  (voice as any).stopListening?.();
+                  (voice as any).pttUp?.();
+                  (voice as any).endListening?.();
+                }
+              }}
+              onDoubleClick={() => {
+                (voice as any).toggleLatch?.();
+                setTimeout(() => {
+                  if ((voice as any).latch) {
+                    (voice as any).startListening?.();
+                    (voice as any).pttDown?.();
+                    (voice as any).beginListening?.();
+                  }
+                }, 0);
+              }}
+              title={(voice as any).latch ? "Latch ON (doble click para cortar)" : "Push-to-Talk (doble click para latch)"}
+            >
+              {(voice as any).latch ? "🎙️ LATCH" : listening ? "🎙️ ESCUCHANDO" : "🎤 Hablar"}
+            </button>
+
+            <input
+              className="border rounded-xl px-3 py-2 w-80"
+              placeholder="Decí algo… ej: 'buscar caño 3/4', 'ítem 1', 'cantidad 3'"
+              onKeyDown={async (e) => {
+                if (e.key === "Enter") {
+                  const v = (e.target as HTMLInputElement).value;
+                  (e.target as HTMLInputElement).value = "";
+                  await interpretAndDispatch(v);
+                }
+              }}
+            />
+
+            <button
+              className="rounded-xl px-4 py-2 bg-neutral-800 text-white"
+              onClick={async () => {
+                if (mode === "FACTURA" && !paymentSel.mop) {
+                  appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI')");
+                  return;
+                }
+                await dispatchAction({ action: "confirm_document" });
+              }}
+            >
+              {loading ? "Procesando…" : "Confirmar"}
+            </button>
+
+            <div className="flex items-center gap-1 ml-3 text-xs">
+              <span className="px-2 py-1 rounded bg-neutral-100">listening: {String(listening)}</span>
+              <span className="px-2 py-1 rounded bg-neutral-100">latch: {String((voice as any).latch)}</span>
               <button
-                className={`rounded-xl px-3 py-2 ${micOn ? "bg-green-600 text-white" : "bg-neutral-200"}`}
-                onClick={() => setMicOn((m) => !m)}
-                title="Mic (stub)"
+                className="px-2 py-1 rounded bg-neutral-200"
+                onClick={() => {
+                  try {
+                    const keys = Object.keys(voice || {});
+                    console.log("[voice] keys:", keys);
+                    appendLog("debug → mirá consola: Object.keys(voice)");
+                  } catch {}
+                }}
               >
-                🎤 {micOn ? "ON" : "OFF"}
+                🔎 keys
               </button>
-              <input
-                className="border rounded-xl px-3 py-2 w-80"
-                placeholder="Decí algo… ej: 'buscar caño 3/4', 'ítem 1', 'cantidad 3'"
-                onKeyDown={async (e) => {
-                  if (e.key === "Enter") {
-                    const v = (e.target as HTMLInputElement).value;
-                    (e.target as HTMLInputElement).value = "";
-                    await interpretAndDispatch(v);
-                  }
-                }}
-              />
               <button
-                className="rounded-xl px-4 py-2 bg-neutral-800 text-white"
-                onClick={async () => {
-                  if (mode === "FACTURA" && !paymentSel.mop) {
-                    appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI')");
-                    return;
-                  }
-                  await dispatchAction({ action: "confirm_document" });
+                className="px-2 py-1 rounded bg-neutral-200"
+                onClick={() => {
+                  (voice as any).startListening?.();
+                  (voice as any).pttDown?.();
+                  (voice as any).beginListening?.();
                 }}
               >
-                {loading ? "Procesando…" : "Confirmar"}
+                ▶ start
+              </button>
+              <button
+                className="px-2 py-1 rounded bg-neutral-200"
+                onClick={() => {
+                  (voice as any).stopListening?.();
+                  (voice as any).pttUp?.();
+                  (voice as any).endListening?.();
+                }}
+              >
+                ⏹ stop
+              </button>
+              <button
+                className="px-2 py-1 rounded bg-neutral-200"
+                onClick={() => {
+                  (voice as any).toggleLatch?.();
+                }}
+              >
+                🔁 latch
               </button>
             </div>
           </div>
+        </div>
 
-          {/* Panel izquierdo: búsqueda */}
-          <div className="bg-white/80 backdrop-blur rounded-2xl shadow p-3">
-            <div className="flex items-center gap-2 mb-3">
-              <input
-                className="border rounded-xl px-3 py-2 w-full"
-                placeholder="¿Qué buscás?"
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                onKeyDown={async (e) => {
-                  if (e.key === "Enter")
-                    await dispatchAction({ action: "search", params: { term: searchTerm } });
-                }}
-              />
-              <button
-                className="rounded-xl px-3 py-2 bg-neutral-800 text-white"
-                onClick={async () =>
-                  await dispatchAction({ action: "search", params: { term: searchTerm } })
-                }
-                disabled={loading}
-              >
-                {loading ? "Buscando…" : "Buscar"}
-              </button>
-            </div>
+        <div className="bg-white/80 backdrop-blur rounded-2xl shadow p-3">
+          <div className="flex items-center gap-2 mb-3">
+            <input
+              className="border rounded-xl px-3 py-2 w-full"
+              placeholder="¿Qué buscás?"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              onKeyDown={async (e) => {
+                if (e.key === "Enter") await dispatchAction({ action: "search", params: { term: searchTerm } });
+              }}
+            />
+            <button
+              className="rounded-xl px-3 py-2 bg-neutral-800 text-white"
+              onClick={async () => await dispatchAction({ action: "search", params: { term: searchTerm } })}
+              disabled={loading}
+            >
+              {loading ? "Buscando…" : "Buscar"}
+            </button>
+          </div>
 
-            <div className="divide-y border rounded-xl overflow-hidden max-h-96 overflow-y-auto">
-              {results.map((r, i) => {
-                const bi = backendItems.find((x) => x.code === r.item_code);
-                const index = bi?.index ?? (i + 1);
-                const mergedQty = r.actual_qty ?? bi?.qty ?? 0;
-                const inStock = mergedQty > 0;
-                const price = r.price_list_rate ?? r.rate ?? bi?.rate ?? 0;
-                const uom = r.stock_uom ?? bi?.uom ?? "Nos";
-                const code = r.item_code ?? "";
-                const brand = bi?.brand ?? undefined;
-                const terms = bi?.terms ?? [];
-                const hit = new Set(bi?.hit_fields ?? []);
-                const nameNode = hit.has("name") ? highlightText(r.item_name, terms) : r.item_name;
-                const codeNode = hit.has("code") ? highlightText(code, terms) : code;
+          <div className="divide-y border rounded-XL overflow-hidden max-h-96 overflow-y-auto">
+            {results.map((r, i) => {
+              const bi = backendItems.find((x) => x.code === r.item_code);
+              const index = bi?.index ?? i + 1;
+              const mergedQty = r.actual_qty ?? bi?.qty ?? 0;
+              const inStock = mergedQty > 0;
+              const price = r.price_list_rate ?? r.rate ?? bi?.rate ?? 0;
+              const uom = r.stock_uom ?? bi?.uom ?? "Nos";
+              const code = r.item_code ?? "";
+              const brand = bi?.brand ?? undefined;
+              const terms = bi?.terms ?? [];
+              const hit = new Set(bi?.hit_fields ?? []);
+              const nameNode = hit.has("name") ? highlightText(r.item_name, terms) : r.item_name;
+              const codeNode = hit.has("code") ? highlightText(code, terms) : code;
 
-                return (
-                  <div
-                    key={code + index}
-                    className={`flex items-center justify-between gap-3 p-3 cursor-pointer ${selectedIndex === index ? "bg-neutral-100" : ""}`}
-                    onClick={() => dispatchAction({ action: "select_index", params: { index } })}
-                    style={{ backgroundColor: inStock ? undefined : "#fafafa" }}
-                  >
-                    <div className="flex-1">
-                      <div className="text-sm font-medium flex items-center gap-2">
-                        <span>{index}. {nameNode}</span>
-                        {!inStock && (
-                          <span
-                            className="text-xs"
-                            style={{ padding: "2px 8px", borderRadius: 999, background: "#e5e7eb", color: "#374151" }}
-                          >
-                            sin stock
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-xs text-neutral-500">
-                        {codeNode} • {uom} • ${price} • stock {mergedQty}
-                        {brand ? <> • {brand}</> : null}
-                      </div>
+              return (
+                <div
+                  key={code + index}
+                  className={`flex items-center justify-between gap-3 p-3 cursor-pointer ${selectedIndex === index ? "bg-neutral-100" : ""}`}
+                  onClick={() => dispatchAction({ action: "select_index", params: { index } })}
+                  style={{ backgroundColor: inStock ? undefined : "#fafafa" }}
+                >
+                  <div className="flex-1">
+                    <div className="text-sm font-medium flex items-center gap-2">
+                      <span>{index}. {nameNode}</span>
+                      {!inStock && (
+                        <span className="text-xs" style={{ padding: "2px 8px", borderRadius: 999, background: "#e5e7eb", color: "#374151" }}>
+                          sin stock
+                        </span>
+                      )}
                     </div>
-                    <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-                      <input
-                        type="number"
-                        min={1}
-                        className="w-20 border rounded-xl px-2 py-1"
-                        value={qtyPer[code] ?? 1}
-                        onChange={(e) => {
-                          const qn = Math.max(1, Math.floor(Number(e.target.value || 1)));
-                          setQtyPer(prev => ({ ...prev, [code]: qn }));
-                        }}
-                      />
-                      <button
-                        className="rounded-xl px-3 py-2 bg-neutral-800 text-white disabled:opacity-60"
-                        onClick={async () => {
-                          await dispatchAction({ action: "select_index", params: { index } });
-                          await dispatchAction({ action: "add_to_cart" });
-                        }}
-                        disabled={loading || (!inStock && mode !== "PRESUPUESTO")}
-                        title={(!inStock && mode !== "PRESUPUESTO") ? "Sin stock en este modo" : "Agregar al carrito"}
-                      >
-                        Agregar
-                      </button>
+                    <div className="text-xs text-neutral-500">
+                      {codeNode} • {uom} • ${price} • stock {mergedQty}
+                      {brand ? <> • {brand}</> : null}
                     </div>
                   </div>
-                );
-              })}
-              {results.length === 0 && (
-                <div className="p-4 text-center text-neutral-500 text-sm">
-                  {loading ? "Cargando…" : "Sin resultados"}
+                  <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                    <input
+                      type="number"
+                      min={1}
+                      className="w-20 border rounded-xl px-2 py-1"
+                      value={qtyPer[code] ?? 1}
+                      onChange={(e) => {
+                        const qn = Math.max(1, Math.floor(Number(e.target.value || 1)));
+                        setQtyPer((prev) => ({ ...prev, [code]: qn }));
+                      }}
+                    />
+                    <button
+                      className="rounded-xl px-3 py-2 bg-neutral-800 text-white disabled:opacity-60"
+                      onClick={async () => {
+                        await dispatchAction({ action: "select_index", params: { index } });
+                        await dispatchAction({ action: "add_to_cart" });
+                      }}
+                      disabled={loading || (!inStock && mode !== "PRESUPUESTO")}
+                      title={!inStock && mode !== "PRESUPUESTO" ? "Sin stock en este modo" : "Agregar al carrito"}
+                    >
+                      Agregar
+                    </button>
+                  </div>
                 </div>
-              )}
+              );
+            })}
+            {results.length === 0 && (
+              <div className="p-4 text-center text-neutral-500 text-sm">
+                {loading ? "Cargando…" : "Sin resultados"}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="bg-white/80 backdrop-blur rounded-2xl shadow p-3 flex flex-col gap-3">
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-semibold">Carrito</div>
+            <div className="flex items-center gap-2">
+              <button className="rounded-xl px-3 py-2 bg-neutral-200" onClick={() => dispatchAction({ action: "clear_cart" })}>
+                Vaciar
+              </button>
             </div>
           </div>
 
-          {/* Panel derecho: carrito */}
-          <div className="bg-white/80 backdrop-blur rounded-2xl shadow p-3 flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <div className="text-sm font-semibold">Carrito</div>
-              <div className="flex items-center gap-2">
-                <button
-                  className="rounded-xl px-3 py-2 bg-neutral-200"
-                  onClick={() => dispatchAction({ action: "clear_cart" })}
-                >
-                  Vaciar
-                </button>
-              </div>
-            </div>
-            <div className="border rounded-xl overflow-hidden">
-              <table className="w-full text-sm">
-                <thead className="bg-neutral-100">
-                  <tr>
-                    <th className="text-left p-2">Item</th>
-                    <th className="text-right p-2">Cant.</th>
-                    <th className="text-right p-2">U$</th>
-                    <th className="text-right p-2">Subtot.</th>
+          <div className="border rounded-xl overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-neutral-100">
+                <tr>
+                  <th className="text-left p-2">Item</th>
+                  <th className="text-right p-2">Cant.</th>
+                  <th className="text-right p-2">U$</th>
+                  <th className="text-right p-2">Subtot.</th>
+                </tr>
+              </thead>
+              <tbody>
+                {cart.map((c, i) => (
+                  <tr key={c.item_code + i} className="border-t">
+                    <td className="p-2">{c.item_name}</td>
+                    <td className="p-2 text-right">{c.qty} {c.uom}</td>
+                    <td className="p-2 text-right">{c.unit_price.toFixed(2)}</td>
+                    <td className="p-2 text-right">{c.subtotal.toFixed(2)}</td>
                   </tr>
-                </thead>
-                <tbody>
-                  {cart.map((c, i) => (
-                    <tr key={c.item_code + i} className="border-t">
-                      <td className="p-2">{c.item_name}</td>
-                      <td className="p-2 text-right">
-                        {c.qty} {c.uom}
-                      </td>
-                      <td className="p-2 text-right">{c.unit_price.toFixed(2)}</td>
-                      <td className="p-2 text-right">{c.subtotal.toFixed(2)}</td>
-                    </tr>
-                  ))}
-                  {cart.length === 0 && (
-                    <tr>
-                      <td colSpan={4} className="p-4 text-center text-neutral-500">
-                        Sin ítems
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
+                ))}
+                {cart.length === 0 && (
+                  <tr>
+                    <td colSpan={4} className="p-4 text-center text-neutral-500">
+                      Sin ítems
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
 
-            {/* Totales */}
-            <div className="ml-auto text-sm">
-              <div>
-                Neto: <span className="font-medium">{total.net.toFixed(2)} {docState.currency}</span>
-              </div>
-              <div>
-                Desc.: <span className="font-medium">{total.discount.toFixed(2)}</span>
-              </div>
-              <div className="text-lg">
-                TOTAL: <span className="font-semibold">{total.grand.toFixed(2)} {docState.currency}</span>
-              </div>
+          <div className="ml-auto text-sm">
+            <div>
+              Neto: <span className="font-medium">{total.net.toFixed(2)} {docState.currency}</span>
             </div>
-
-            {/* Acciones */}
-            <div className="flex items-center gap-2">
-              <button
-                className="rounded-xl px-4 py-2 bg-neutral-800 text-white disabled:opacity-50"
-                disabled={loading || cart.length === 0}
-                onClick={async () => {
-                  if (mode === "FACTURA" && !paymentSel.mop) {
-                    appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI')");
-                    return;
-                  }
-                  await dispatchAction({ action: "confirm_document" });
-                }}
-              >
-                {loading ? "Procesando…" : "Confirmar"}
-              </button>
-
-              <button
-                className="rounded-xl px-4 py-2 bg-neutral-200 text-neutral-900"
-                onClick={() => window.print?.()}
-              >
-                Imprimir
-              </button>
+            <div>
+              Desc.: <span className="font-medium">{total.discount.toFixed(2)}</span>
             </div>
-
-            {/* Consola */}
-            <div className="col-span-2 bg-white/80 backdrop-blur rounded-2xl shadow p-3">
-              <div className="text-sm font-semibold mb-2">Consola</div>
-              <pre className="text-xs whitespace-pre-wrap max-h-48 overflow-auto border rounded-xl p-3 bg-neutral-50">
-{ACTIONS_DOC}
-{"\n"}
-{log.map((l) => `• ${l}`).join("\n")}
-              </pre>
+            <div className="text-lg">
+              TOTAL: <span className="font-semibold">{total.grand.toFixed(2)} {docState.currency}</span>
             </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              className="rounded-xl px-4 py-2 bg-neutral-800 text-white disabled:opacity-50"
+              disabled={loading || cart.length === 0}
+              onClick={async () => {
+                if (mode === "FACTURA" && !paymentSel.mop) {
+                  appendLog("✖ falta seleccionar modo de pago (decí: 'pago efectivo' o elegilo en la UI')");
+                  return;
+                }
+                await dispatchAction({ action: "confirm_document" });
+              }}
+            >
+              {loading ? "Procesando…" : "Confirmar"}
+            </button>
+
+            <button className="rounded-xl px-4 py-2 bg-neutral-200 text-neutral-900" onClick={() => window.print?.()}>
+              Imprimir
+            </button>
+          </div>
+
+          <div className="bg-white/80 backdrop-blur rounded-2xl shadow p-3">
+            <div className="text-sm font-semibold mb-2">Consola</div>
+            <pre className="text-xs whitespace-pre-wrap max-h-48 overflow-auto border rounded-xl p-3 bg-neutral-50">
+              {ACTIONS_DOC}
+              {"\n"}
+              {log.map((l) => `• ${l}`).join("\n")}
+            </pre>
           </div>
         </div>
       </div>
     </div>
-  );
+  </div>
+);
 }
-// END App.tsx
+
+
+
