@@ -1,0 +1,134 @@
+    # ===== Guardrail A: confirm_document solo si el usuario lo pidió explícitamente =====
+    confirm_regex = re.compile(
+        r"\b(confirm(ar|o|ado|ame|emos)?|factur(a|á|ar)|emit(ir|í)\s+(la\s+)?(factura|comprobante)|cerr(ar|á)\s+venta)\b",
+        re.I
+    )
+    user_wants_confirm = bool(confirm_regex.search(user_text))
+    if not user_wants_confirm:
+        safe_actions = [a for a in safe_actions if a.get("action") != "confirm_document"]
+
+    # (Opcional) Guardrails adicionales se pueden añadir acá...
+
+    # --- 8) Salida ---
+    return {"actions": safe_actions}
+
+
+# ===== Guardrail B: add_to_cart requiere selección previa =====
+has_prior_select = any(a["action"] == "select_index" for a in safe_actions)
+selected_index_state = state.get("selected_index")
+if not has_prior_select and not selected_index_state:
+    safe_actions = [a for a in safe_actions if a["action"] != "add_to_cart"]
+if any(a["action"] == "add_to_cart" for a in safe_actions):
+    idx_actions = [a for a in safe_actions if a["action"] == "select_index"]
+    idx = idx_actions[0]["params"].get("index") if idx_actions else state.get("selected_index")
+    results_len = len(state.get("results") or [])
+    if not idx or not (1 <= int(idx) <= results_len):
+        safe_actions = [a for a in safe_actions if a["action"] != "add_to_cart"]
+
+# ===== Guardrail C: clear_cart solo si la frase lo pide explícito =====
+clear_regex = re.compile(r"\b(vacia(?:r)?|vaciar|limpia(?:r)?|limpiar|borra(?:r)?)\b.*\bcarrito\b", re.I)
+user_wants_clear = bool(clear_regex.search(user_text))
+if not user_wants_clear:
+    safe_actions = [
+        a for a in safe_actions
+        if a["action"] != "clear_cart"
+    ]
+
+# ===== Guardrail D: remove_from_cart solo si la frase lo pide explícito =====
+remove_regex = re.compile(r"\b(borra(?:r)?|elimina(?:r)?|saca(?:r)?|quita(?:r)?)\b.*\b(item|ítem|producto|artículo|carrito)\b", re.I)
+user_wants_remove = bool(remove_regex.search(user_text))
+if not user_wants_remove:
+    safe_actions = [
+        a for a in safe_actions
+        if a["action"] != "remove_from_cart"
+    ]
+
+# ===== Guardrail E: remove_last_item solo si se menciona “último” =====
+remove_last_regex = re.compile(r"\b(últim[oa]?|ultimo|lo\s+último|final)\b", re.I)
+user_wants_remove_last = bool(remove_last_regex.search(user_text))
+if not user_wants_remove_last:
+    safe_actions = [
+        a for a in safe_actions
+        if a["action"] != "remove_last_item"
+    ]
+
+# ===== Guardrail G: frases de BÚSQUEDA → SOLO search =====
+search_only_regex = re.compile(
+    r"\b(busca(?:r|me)?|buscame|buscar|mostra(?:r|me)?|mostrar|mostrame|quiero ver|mostrame algo|mostrame productos)\b",
+    re.I
+)
+if search_only_regex.search(user_text):
+    safe_actions = [a for a in safe_actions if a["action"] == "search"]
+    # normalizar alias "query"→"term" por las dudas
+    for a in safe_actions:
+        if a["action"] == "search" and "query" in (a.get("params") or {}):
+            a["params"]["term"] = a["params"].pop("query", "")
+
+# ===== Guardrail H: set_mode SOLO si el usuario lo pide explícitamente =====
+mode_explicit_regex = re.compile(
+    r"\bmodo\s+(factura|presupuesto|remito)\b|\b(pasar|pon(e|er)|cambiar)\s+a\s+modo\s+(factura|presupuesto|remito)\b",
+    re.I
+)
+if not mode_explicit_regex.search(user_text):
+    safe_actions = [a for a in safe_actions if a["action"] != "set_mode"]
+
+
+# ===== Guardrail I: set_payment SOLO si hay intención de pago =====
+pay_intent_regex = re.compile(
+    r"\b(pag(a|ar|ame)|cobr(a|ar|ame)|efectivo|tarjeta|debito|d[eé]bito|cr[eé]dito|transferencia|qr|mercado\s*pago|mp|pago)\b",
+    re.I
+)
+if not pay_intent_regex.search(user_text):
+    safe_actions = [a for a in safe_actions if a["action"] != "set_payment"]
+
+# ===== Guardrail J: respetar índice textual para remove_from_cart cuando el usuario lo dijo =====
+try:
+    norm_info = normalize_es(user_text or "")
+    txt_norm = norm_info.get("text") or ""
+    idx_from_text = parse_index_from_text(txt_norm)  # 1-based si dijo "ítem 1"
+except Exception:
+    idx_from_text = None
+
+# Si la frase menciona "carrito" y hay un índice textual, lo imponemos sobre params.index
+if re.search(r"\bcarrito\b", (user_text or ""), flags=re.I) and idx_from_text:
+    for a in safe_actions:
+        if a.get("action") == "remove_from_cart":
+            a.setdefault("params", {})["index"] = int(idx_from_text)
+
+# Validación final del índice contra el tamaño real del carrito (si está en state)
+cart_len = 0
+try:
+    cart_len = len(state.get("cart") or [])
+except Exception:
+    cart_len = 0
+
+safe_actions2 = []
+for a in safe_actions:
+    if a.get("action") == "remove_from_cart":
+        i = None
+        try:
+            i = int((a.get("params") or {}).get("index") or 0)
+        except Exception:
+            i = None
+
+        if i is not None and cart_len > 0:
+            if 1 <= i <= cart_len:
+                safe_actions2.append(a)
+            else:
+                safe_actions2.append({
+                    "action": "ask_user",
+                    "params": {"question": f"¿Qué ítem del carrito querés borrar? Decime un número del 1 al {cart_len}."}
+                })
+        else:
+            name = (a.get("params") or {}).get("name")
+            if name:
+                safe_actions2.append(a)
+            else:
+                safe_actions2.append({
+                    "action": "ask_user",
+                    "params": {"question": "¿Cuál ítem del carrito querés borrar? Decime un índice (1..N) o el nombre."}
+                })
+    else:
+        safe_actions2.append(a)
+
+safe_actions = safe_actions2
