@@ -4,6 +4,10 @@ import { useRealtimeVoice } from "./voice/useRealtimeVoice";
 import React, { useMemo, useState, useRef, useEffect } from "react";
 import { ArtPollock } from "./ArtPollock";
 import { CustomerPicker } from "./CustomerPicker";
+// App.tsx (arriba con el resto de imports)
+import { preloadBrandAliases } from "./llm/interpret";
+import { newTrace } from "./utils/trace";
+import { preloadAttributes, _debugAttributes } from "./llm/attributes";
 import {
   // interpretAndDispatch (REMOVIDO: ya lo definimos abajo)
   type ActionsDoc as LLMActionsDoc,
@@ -27,6 +31,37 @@ type SearchResult = {
   description?: string | null;
 };
 
+// === Nuevo: tipos para filtros del backend NLU ===
+type AppliedFilters = {
+  name?: string | null;
+  size_mm?: number | null;
+  size_in?: number | null;
+  unit_pref?: "mm" | "in" | null;
+  brands?: string[];
+  tags?: string[];
+  attributes?: Record<string, string>; // ⬅️ nuevo
+};
+
+type SearchResponseV2 = {
+  term: string;
+  term_raw?: string;
+  applied_filters?: AppliedFilters;
+  items?: Array<{
+    code: string;
+    name: string;
+    uom: string;
+    rate: number;
+    qty: number;
+    brand?: string | null;
+    desc?: string | null;
+    hit_fields?: string[];
+  }>;
+  meta?: { tried_terms?: string[] };
+};
+
+// Para compat legacy (mensaje viejo)
+type LegacySearchMessage = SearchResult[];
+
 type BackendItem = {
   index: number;
   code: string;
@@ -49,6 +84,7 @@ type CartLine = {
   subtotal: number;
   warehouse?: string;
   taxes?: Record<string, any>;
+  index?: number;
 };
 
 type DocumentState = {
@@ -95,6 +131,8 @@ function stripDiacritics(s: string) {
 }
 function normalizeTextFront(s: string) {
   return stripDiacritics((s || "") + "")
+    .toLowerCase()
+    .trim()
     .replace(/[^a-z0-9/.\s-]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -146,10 +184,80 @@ function highlightText(text: string, terms: string[] | undefined) {
   if (cursor < text.length) out.push(text.slice(cursor));
   return <>{out}</>;
 }
+// === Helpers de filtros → chips
+// Etiquetas amigables para atributos del ERP
+const ATTR_LABELS: Record<string, string> = {
+  Size: "Diámetro",
+  Colour: "Color",
+};
+
+function filtersToChips(f: AppliedFilters | null | undefined): { key: string; label: string }[] {
+  if (!f) return [];
+  const chips: { key: string; label: string }[] = [];
+
+  if (f.name) chips.push({ key: "name", label: f.name });
+
+  if (f.unit_pref === "mm" && f.size_mm != null) {
+    chips.push({ key: "size_mm", label: `${f.size_mm} mm` });
+  }
+  if (f.unit_pref === "in" && f.size_in != null) {
+    chips.push({ key: "size_in", label: `${f.size_in} in` });
+  }
+
+  if (Array.isArray(f.brands) && f.brands.length) {
+    f.brands.forEach((b, i) => chips.push({ key: `brand:${i}`, label: b }));
+  }
+  if (Array.isArray(f.tags) && f.tags.length) {
+    f.tags.forEach((t, i) => chips.push({ key: `tag:${i}`, label: t }));
+  }
+
+  // ⬇️ NUEVO: chips para atributos del ERP (p.ej. Size / Colour)
+  if (f.attributes) {
+    for (const [k, v] of Object.entries(f.attributes)) {
+      const label = `${ATTR_LABELS[k] ?? k}: ${v}`;
+      chips.push({ key: `attr:${k}`, label });
+    }
+  }
+
+  return chips;
+}
+
+function removeChip(f: AppliedFilters | null, chipKey: string): AppliedFilters | null {
+  if (!f) return f;
+  const nf: AppliedFilters = JSON.parse(JSON.stringify(f));
+
+  if (chipKey === "name") {
+    nf.name = null;
+  } else if (chipKey === "size_mm") {
+    nf.size_mm = null;
+    nf.unit_pref = nf.size_in != null ? "in" : nf.unit_pref;
+  } else if (chipKey === "size_in") {
+    nf.size_in = null;
+    nf.unit_pref = nf.size_mm != null ? "mm" : nf.unit_pref;
+  } else if (chipKey.startsWith("brand:")) {
+    const i = Number(chipKey.split(":")[1] || -1);
+    if (Array.isArray(nf.brands)) nf.brands = nf.brands.filter((_, idx) => idx !== i);
+  } else if (chipKey.startsWith("tag:")) {
+    const i = Number(chipKey.split(":")[1] || -1);
+    if (Array.isArray(nf.tags)) nf.tags = nf.tags.filter((_, idx) => idx !== i);
+  } else if (chipKey.startsWith("attr:")) {
+    // Quitar un atributo específico (p.ej. "attr:Size")
+    const key = chipKey.slice(5);
+    if (nf.attributes) {
+      const { [key]: _omit, ...rest } = nf.attributes;
+      nf.attributes = Object.keys(rest).length ? rest : undefined;
+    }
+  }
+
+  return nf;
+}
+
+
 
 // ===== App =====
 export default function App() {
   // Estado
+  const lastQueryRef = useRef<string>("");
   const resumenRef = useRef<string[]>([]);
   const pushResumen = (s: string) => {
     if (s) resumenRef.current.push(s);
@@ -160,6 +268,9 @@ export default function App() {
   const [searchTerm, setSearchTerm] = useState<string>("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [backendItems, setBackendItems] = useState<BackendItem[]>([]);
+  // === Nuevo: guardamos filtros aplicado por el backend y términos alternativos intentados
+  const [appliedFilters, setAppliedFilters] = useState<AppliedFilters | null>(null);
+  const [triedTerms, setTriedTerms] = useState<string[]>([]);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const qtyRef = useRef<number>(1);
   const lastAddRef = useRef<{ key: string; t: number } | null>(null);
@@ -180,7 +291,30 @@ export default function App() {
     { name: string; accounts?: { company?: string; account?: string }[] }[]
   >([]);
   const [paymentSel, setPaymentSel] = useState<{ mop?: string; account?: string }>({});
-
+  // ===== Carga de datos inicial (brands + attributes) =====
+  useEffect(() => {
+    let cancelled = false;
+  
+    async function initData() {
+      try {
+        // BRANDS
+        await preloadBrandAliases(BRIDGE_BASE);
+        if (!cancelled) appendLog?.("• brands alias precargados desde /bridge/brands");
+  
+        // ATTRIBUTES (primero sin nombres; luego podés filtrar)
+        await preloadAttributes(BRIDGE_BASE, ["Size", "Colour"]);
+        if (!cancelled) appendLog?.("• atributos precargados: Size, Colour");
+      } catch (e) {
+        appendLog?.(`• error precargando datos: ${String(e)}`);
+      }
+    }
+  
+    initData();
+    return () => { cancelled = true; };
+  }, []);
+  
+    
+  
   // resultsRef para voz/planner
   const resultsRef = useRef<SearchResult[]>([]);
   useEffect(() => {
@@ -288,34 +422,100 @@ export default function App() {
     }
   }
 
-  // /bridge/search_with_stock + filtro + ranking + highlight en el front
-  async function apiSearch(term: string): Promise<SearchResult[]> {
-    setLoading(true);
-    try {
-      const r = await fetch(`${BRIDGE_BASE}/bridge/search_with_stock`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          query: term,
-          warehouse: "Sucursal Adrogue - HT",
-          pos_profile: "Sucursal Adrogue",
-          limit: 20,
-          page: 1,
-        }),
+// /bridge/search_with_stock + filtro + ranking + highlight en el front (v2 + legacy)
+async function apiSearch(term: string, filters?: AppliedFilters | null): Promise<SearchResult[]> {
+  setLoading(true);
+
+  // === TRACE: iniciamos un trazo por búsqueda
+  const tr = newTrace("search")
+    .mark("original_text", term)
+    .mark("filters_sent", filters || null);
+
+  try {
+    const body: any = {
+      query: term,
+      warehouse: "Sucursal Adrogue - HT",
+      pos_profile: "Sucursal Adrogue",
+      limit: 20,
+      page: 1,
+    };
+    if (filters) body.filters = filters;
+
+    const r = await fetch(`${BRIDGE_BASE}/bridge/search_with_stock`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // ⬇️ mandamos el trace_id al backend (si después querés loguearlo ahí)
+        "X-Trace-Id": tr.id,
+      },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(`search_with_stock status ${r.status}`);
+
+    const data = await r.json();
+
+    const isV2 =
+      data && (data.term || data.applied_filters || data.items || (data.meta && data.meta.tried_terms));
+
+    let list: SearchResult[] = [];
+    let v2Items: BackendItem[] = [];
+
+    if (isV2) {
+      const v2: SearchResponseV2 = data;
+
+      setAppliedFilters(v2.applied_filters || null);
+      setTriedTerms(v2.meta?.tried_terms || []);
+
+      const items = Array.isArray(v2.items) ? v2.items : [];
+      v2Items = items.map((it, idx) => ({
+        index: idx + 1,
+        code: it.code,
+        name: it.name,
+        uom: it.uom || "Nos",
+        rate: Number(it.rate ?? 0),
+        qty: Number(it.qty ?? 0),
+        brand: it.brand ?? null,
+        desc: it.desc ?? null,
+        hit_fields: it.hit_fields || [],
+        terms: tokenizeTerms(v2.term || term),
+      }));
+      setBackendItems(v2Items);
+
+      list = items.map((it) => ({
+        item_code: it.code,
+        item_name: it.name,
+        stock_uom: it.uom || "Nos",
+        price_list_rate: Number(it.rate ?? 0),
+        actual_qty: Number(it.qty ?? 0),
+        description: it.desc ?? null,
+      }));
+
+      // cerrar traza con info útil
+      tr.end({
+        isV2: true,
+        term_normalized: v2.term ?? null,
+        count: items.length,
+        applied_filters_final: v2.applied_filters ?? null,
+        tried_terms: v2.meta?.tried_terms ?? [],
       });
-      if (!r.ok) throw new Error(`search_with_stock status ${r.status}`);
-      const data = await r.json();
-      const list: SearchResult[] = (data && data.message) || [];
+
+    } else {
+      // === Legacy (data.message es una lista de SearchResult) ===
+      const legacy: LegacySearchMessage = (data && data.message) || [];
+
+      // preservamos filtros
+      setAppliedFilters((prev) => (filters ?? prev ?? null));
+      setTriedTerms([]);
 
       const toks = tokenizeTerms(term);
       const isMatch = (it: SearchResult) => {
         if (toks.length === 0) return true;
         const nName = normalizeTextFront(it.item_name || "");
-               const nCode = normalizeTextFront(it.item_code || "");
+        const nCode = normalizeTextFront(it.item_code || "");
         const nDesc = normalizeTextFront(it.description || "");
         return toks.every((t) => nName.includes(t) || nCode.includes(t) || nDesc.includes(t));
       };
-      const filtered = list.filter(isMatch);
+      const filtered = legacy.filter(isMatch);
 
       type Scored = { it: SearchResult; score: number; hit_fields: string[] };
       const scored: Scored[] = filtered.map((it) => {
@@ -339,7 +539,7 @@ export default function App() {
 
       scored.sort((a, b) => b.score - a.score);
 
-      const newBackendItems: BackendItem[] = scored.map((s, idx) => ({
+      v2Items = scored.map((s, idx) => ({
         index: idx + 1,
         code: s.it.item_code,
         name: s.it.item_name,
@@ -351,17 +551,32 @@ export default function App() {
         hit_fields: s.hit_fields,
         terms: toks,
       }));
-      setBackendItems(newBackendItems);
+      setBackendItems(v2Items);
 
-      return scored.slice(0, 20).map((s) => s.it);
-    } catch (e: any) {
-      appendLog(`✖ búsqueda falló: ${e?.message ?? e}`);
-      setBackendItems([]);
-      return [];
-    } finally {
-      setLoading(false);
+      list = scored.slice(0, 20).map((s) => s.it);
+
+      tr.end({
+        isV2: false,
+        count: list.length,
+        tokens: toks,
+        applied_filters_final: filters ?? null,
+      });
     }
+
+    return list;
+  } catch (e: any) {
+    appendLog(`✖ búsqueda falló: ${e?.message ?? e}`);
+    setBackendItems([]);
+    setAppliedFilters(null);
+    setTriedTerms([]);
+    tr.end({ error: String(e?.message ?? e) });
+    return [];
+  } finally {
+    setLoading(false);
   }
+}
+
+  
 
   // ===== Confirmación =====
   function buildConfirmPayload() {
@@ -465,105 +680,156 @@ export default function App() {
     }
   }
 
-  // ===== Planner + Voz =====
-  async function interpretAndDispatch(text: string) {
-    try {
-      const resultsSnapshot =
-        (backendItems && backendItems.length
-          ? backendItems.map((bi) => ({
-              index: bi.index,
-              item_code: bi.code,
-              item_name: bi.name,
-            }))
-          : results.map((r, i) => ({
-              index: i + 1,
-              item_code: r.item_code,
-              item_name: r.item_name,
-            }))) || [];
+// ===== Planner + Voz =====
+async function interpretAndDispatch(text: string) {
+  try {
+    const resultsSnapshot =
+      (backendItems && backendItems.length
+        ? backendItems.map((bi) => ({
+            index: bi.index,
+            item_code: bi.code,
+            item_name: bi.name,
+          }))
+        : results.map((r, i) => ({
+            index: i + 1,
+            item_code: r.item_code,
+            item_name: r.item_name,
+          }))) || [];
 
-      const state = {
-        mode,
-        customer,
-        total: {
-          net: total.net,
-          discount: total.discount,
-          grand: total.grand,
-          currency: docState.currency,
-        },
-        cart: cart.map((c) => ({
-          item_code: c.item_code,
-          qty: c.qty,
-          uom: c.uom,
-          unit_price: c.unit_price,
-        })),
-        results: resultsSnapshot,
-        selected_index: selectedIndex,
-        qty_hint: qty,
-        payment:
-          mode === "FACTURA" && paymentSel.mop
-            ? { mop: paymentSel.mop, account: paymentSel.account || undefined }
-            : undefined,
-      };
+    const state = {
+      mode,
+      customer,
+      total: {
+        net: total.net,
+        discount: total.discount,
+        grand: total.grand,
+        currency: docState.currency,
+      },
+      cart: cart.map((c) => ({
+        item_code: c.item_code,
+        qty: c.qty,
+        uom: c.uom,
+        unit_price: c.unit_price,
+      })),
+      results: resultsSnapshot,
+      selected_index: selectedIndex,
+      qty_hint: qty,
+      payment:
+        mode === "FACTURA" && paymentSel.mop
+          ? { mop: paymentSel.mop, account: paymentSel.account || undefined }
+          : undefined,
+    };
 
-      const catalogList = [
-        "set_mode",
-        "search",
-        "select_index",
-        "set_qty",
-        "add_to_cart",
-        "set_global_discount",
-        "set_customer",
-        "set_payment",
-        "confirm_document",
-        "clear_cart",
-        "repeat",
-      ];
+    const catalogList = [
+      "set_mode",
+      "search",
+      "select_index",
+      "set_qty",
+      "add_to_cart",
+      "set_global_discount",
+      "set_customer",
+      "set_payment",
+      "confirm_document",
+      "clear_cart",
+      "repeat",
+      "remove_from_cart",
+      "remove_last_item",
+    ];
 
-      // Snapshot fresco para planner + anti-race básico
-      const plannerResults = (resultsRef.current ?? [])
-        .slice(0, 12)
-        .map((r: any, i: number) => ({
-          index: i + 1,
-          item_code: r.item_code,
-          item_name: r.item_name,
-        }));
-      const stateForPlanner = { ...state, results: plannerResults };
+    // Snapshot fresco para planner + anti-race básico
+    const plannerResults = (resultsRef.current ?? [])
+      .slice(0, 12)
+      .map((r: any, i: number) => ({
+        index: i + 1,
+        item_code: r.item_code,
+        item_name: r.item_name,
+      }));
+    const stateForPlanner = { ...state, results: plannerResults };
 
-      console.log("→ interpret payload.state.results.length =", stateForPlanner.results?.length || 0);
-      console.log("→ interpret payload", { text, state: stateForPlanner, catalog: catalogList });
+    console.log("→ interpret payload.state.results.length =", stateForPlanner.results?.length || 0);
+    console.log("→ interpret payload", { text, state: stateForPlanner, catalog: catalogList });
 
-      const r = await fetch(`${BRIDGE_BASE}/bridge/interpret`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, state: stateForPlanner, catalog: catalogList }),
+    // --- llamada a /bridge/interpret con trazado y log de error detallado ---
+    const trace = newTrace("interpret");
+    const resp = await fetch(`${BRIDGE_BASE}/bridge/interpret`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Trace-Id": trace.id,
+      },
+      body: JSON.stringify({ text, state: stateForPlanner, catalog: catalogList }),
+    });
+    if (!resp.ok) {
+      let raw = "";
+      try { raw = await resp.text(); } catch {}
+      console.error("interpret HTTP error", {
+        status: resp.status,
+        statusText: resp.statusText,
+        headers: Object.fromEntries(resp.headers.entries()),
+        body: raw,
       });
-      if (!r.ok) throw new Error(`/bridge/interpret ${r.status}`);
-      const data = await r.json();
-      const actions = Array.isArray(data?.actions) ? data.actions : [];
-      console.log("→ interpret actions", JSON.stringify(actions, null, 2));
-      // --- SAFE CONFIRM GUARD ---
-      // Solo permitimos 'confirm_document' si el texto del usuario realmente lo pide.
-      const confirmRegex =
-        /\b(confirm(ar|o|ado|ame|emos)?|factur(a|á|ar)|emit(ir|í) (la )?(factura|comprobante)|cerr(a|ar) venta)\b/i;
-
-      const userAskedToConfirm = confirmRegex.test(text);
-
-      // Si el usuario NO pidió confirmar, filtramos cualquier confirm_document que haya sugerido el planner
-      const safeActions = userAskedToConfirm ? actions : actions.filter((a) => a.action !== "confirm_document");
-
-      if (!userAskedToConfirm && actions.some((a) => a.action === "confirm_document")) {
-        appendLog("🔒 confirmación bloqueada: falta pedido explícito (decí 'confirmar').");
-      }
-      // Ejecutamos SOLO las acciones seguras (filtradas) en lote coherente
-      if (safeActions.length === 0) {
-        appendLog("interpret → sin acciones");
-        return;
-      }
-      await dispatchActionsBatch(safeActions);
-    } catch (e: any) {
-      appendLog(`✖ interpret falló: ${e?.message ?? e}`);
+      throw new Error(`/bridge/interpret ${resp.status}`);
     }
+    const data = await resp.json();
+
+    const actions = Array.isArray(data?.actions) ? data.actions : [];
+    console.log("→ interpret actions", JSON.stringify(actions, null, 2));
+
+    // --- SAFE GUARDS (confirmación + browse vs. acción) ---
+
+    // Confirm solo si lo pidió explícitamente
+    const confirmRegex =
+      /\b(confirm(ar|o|ado|ame|emos)?|factur(a|á|ar)|emit(ir|í)[^\w]*(la )?(factura|comprobante)|cerr(a|ar)\s*venta)\b/i;
+    const userAskedToConfirm = confirmRegex.test(text);
+
+    // Detectar intención de agregar, seleccionar y “listar/mostrar/buscar”
+    const addRegex = /\b(agrega(?:r|me)?|sumar|añadir|poner|meter|insertar|agregá|agrega)\b/i;
+    const selectRegex = /\b(?:ítem|item)\s+\d+\b/i;
+    const browseRegex =
+      /\b(mostr(a|ame|ar)|busc(a|ame|ar|á)|que\s+tenemos|qué\s+tenemos|qué\s+hay|que\s+hay|ver|listar|listá|listame|muestrame|muéstrame|ten(e|é)s|tenemos|hay|existe|alg[uú]n|alguna)\b/i;
+
+    const userAskedToAdd = addRegex.test(text);
+    const userAskedToSelect = selectRegex.test(text);
+    const userBrowse = browseRegex.test(text);
+
+    // 1) Confirmación: si no lo pidió, sacamos confirm_document
+    let safeActions = userAskedToConfirm
+      ? actions
+      : actions.filter((a) => a.action !== "confirm_document");
+
+    if (!userAskedToConfirm && actions.some((a) => a.action === "confirm_document")) {
+      appendLog("🔒 confirmación bloqueada: falta pedido explícito (decí 'confirmar').");
+    }
+
+    // 2) Agregado: si NO dijo "agregar/sumar/..." removemos add_to_cart SIEMPRE
+    const hadAdd = actions.some((a) => a.action === "add_to_cart");
+    if (!userAskedToAdd) {
+      safeActions = safeActions.filter((a) => a.action !== "add_to_cart");
+      if (hadAdd) appendLog("🔒 agregado bloqueado: decí 'agregar' si querés sumar al carrito.");
+    }
+
+    // 3) Browse: si está consultando/listando y NO pidió seleccionar NI agregar,
+    //    quitamos select_index y set_qty (no tiene sentido mover la selección sola)
+    if (userBrowse && !userAskedToAdd && !userAskedToSelect) {
+      const beforeSel = safeActions.length;
+      safeActions = safeActions.filter((a) => !["select_index", "set_qty"].includes(a.action));
+      if (beforeSel !== safeActions.length) {
+        appendLog("🔒 selección bloqueada: consulta/listado sin pedido explícito.");
+      }
+    }
+
+    // Ejecutamos SOLO las acciones seguras (filtradas) en lote coherente
+    if (safeActions.length === 0) {
+      appendLog("interpret → sin acciones");
+      return;
+    }
+    await dispatchActionsBatch(safeActions);
+  } catch (e: any) {
+    appendLog(`✖ interpret falló: ${e?.message ?? e}`);
   }
+}
+
+      
 
   // ===== Dispatcher (ÚNICO) =====
   type Action = { action: string; params?: Record<string, any> };
@@ -625,26 +891,148 @@ export default function App() {
 
       case "search": {
         const raw = (a.params?.term ?? a.params?.query ?? "").toString();
-
+      
         // Si parece una orden con índice/cantidad, re-interpretamos ese texto
-        if (/^\s*(?:item|ítem|\d+)\b/i.test(raw) || /\b(agrega(?:r)?|sumar|poner|añadir)\b/i.test(raw)) {
+        if (
+          /^\s*(?:item|ítem|\d+)\b/i.test(raw) ||
+          /\b(agrega(?:r)?|sumar|poner|añadir)\b/i.test(raw)
+        ) {
           await interpretAndDispatch(raw);
           break;
         }
-
-        const cleaned = raw.replace(/^\s*(?:busc(?:a|ar|á|ame)?|search|find)\b[:,-]?\s*/i, "");
+      
+        // Limpieza de prefijo "busca/buscar/buscá/buscame..."
+        const cleaned = raw.replace(
+          /^\s*(?:busc(?:a|ar|á|ame)?|search|find)\b[:,-]?\s*/i,
+          ""
+        );
         const term = cleaned || raw;
-
-        const data = await apiSearch(term);
+      
+        // --- Normalización anti-ASR + unidades ---
+        const normalizeASR = (s: string) =>
+          s
+            // ruidos de ASR
+            .replace(/\bcañidos?\b/gi, "caños")
+            .replace(/\bcanios?\b/gi, "caños")
+            .replace(/\baquaplas?t\b/gi, "Aquaplas")
+            // unidades
+            .replace(/\bmil[ií]metros?\b/gi, "mm")
+            .replace(/\bcent[ií]metros?\b/gi, "cm")
+            .replace(/\bpulg(?:ada|adas)?\b/gi, "in")
+            // fracciones en palabras
+            .replace(/\btres\s+cuartos\b/gi, "3/4")
+            .replace(/\bun\s+cuarto\b/gi, "1/4")
+            // “de media” muy usado → 1/2
+            .replace(/\bde\s+(?:la\s+)?media\b/gi, "1/2")
+            .replace(
+              /\bmedia\s+(cañ[oa]s?|codos?|tees?|tubos?|niples?|nipple|rosca|válvulas?)\b/gi,
+              "1/2 $1"
+            )
+            // variantes con in + espacios
+            .replace(/\b1\/2\s*in\b/gi, '1/2"')
+            .replace(/\b3\/4\s*in\b/gi, '3/4"');
+      
+        const termNorm = normalizeASR(term);
+      
+        // --- Heurística: deducir filtros de tamaño si el usuario dijo “N mm” o “N in / N" / fracción” ---
+        const evalFraction = (s: string) => {
+          const m = String(s).trim().match(/^(\d+)\s*\/\s*(\d+)$/);
+          if (!m) return parseFloat(String(s).replace(",", "."));
+          const n = parseFloat(m[1] || "0");
+          const d = parseFloat(m[2] || "1");
+          return d ? n / d : n;
+        };
+      
+        let filtersHint: AppliedFilters | null = null;
+      
+        const mmMatch = termNorm.match(/\b(\d+(?:[.,]\d+)?)\s*mm\b/i);
+        const inMatch = termNorm.match(/\b(\d+(?:[.,]\d+)?)\s*(?:in|")\b/i);
+        const fracMatch = termNorm.match(/\b(\d+)\s*\/\s*(\d+)\s*(?:in|")?\b/i);
+      
+        if (mmMatch) {
+          const val = parseFloat(mmMatch[1].replace(",", "."));
+          filtersHint = {
+            unit_pref: "mm",
+            size_mm: val,
+            size_in: +(val / 25.4).toFixed(4),
+            brands: [],
+            tags: [],
+            name: undefined,
+          };
+        } else if (inMatch) {
+          const val = parseFloat(inMatch[1].replace(",", "."));
+          filtersHint = {
+            unit_pref: "in",
+            size_in: val,
+            size_mm: +(val * 25.4).toFixed(2),
+            brands: [],
+            tags: [],
+            name: undefined,
+          };
+        } else if (fracMatch) {
+          const val = evalFraction(`${fracMatch[1]}/${fracMatch[2]}`);
+          filtersHint = {
+            unit_pref: "in",
+            size_in: val,
+            size_mm: +(val * 25.4).toFixed(2),
+            brands: [],
+            tags: [],
+            name: undefined,
+          };
+        }
+      
+        // --- Singularización MUY básica (último token) para mostrar en el input ---
+        const toSingular = (w: string) => {
+          const lw = w.toLowerCase();
+          if (lw.length > 3 && lw.endsWith("es")) return w.slice(0, -2);
+          if (lw.length > 2 && lw.endsWith("s")) return w.slice(0, -1);
+          return w;
+        };
+        const parts = termNorm.trim().split(/\s+/);
+        if (parts.length > 0) {
+          parts[parts.length - 1] = toSingular(parts[parts.length - 1]);
+        }
+        const displayTerm = parts.join(" ");
+      
+        // detectar si es “consulta nueva” (solo para métricas/UX, no para arrastrar filtros)
+        const isNewQuery =
+          normalizeTextFront(displayTerm) !==
+          normalizeTextFront(lastQueryRef.current || "");
+      
+        // Traza (debug)
+        const trReset = newTrace("reset-decision")
+          .mark("display_term", displayTerm)
+          .mark("isNewQuery", isNewQuery)
+          .mark("filters_before", appliedFilters || null);
+      
+        // ✅ Stateless: esta búsqueda usa SOLO lo deducido ahora
+        const filtersToSend = filtersHint ?? null;
+      
+        // Sobrescribimos chips para esta búsqueda (no quedan pegados a la próxima)
+        setAppliedFilters(filtersToSend);
+      
+        trReset.end({ filters_sent: filtersToSend || null });
+      
+        // ejecutar búsqueda
+        const data = await apiSearch(displayTerm, filtersToSend);
+      
         setResults(data);
         resultsRef.current = data;
+      
         const sel = data.length ? 1 : null;
         setSelectedIndex(sel);
         selectedIndexRef.current = sel ?? 0;
-        setSearchTerm(term);
-        appendLog(`buscando: "${term}" (${data.length} resultados)`);
+      
+        // Mostramos el término "amigable" en el input
+        setSearchTerm(displayTerm);
+      
+        appendLog(`buscando: "${displayTerm}" (${data.length} resultados)`);
         break;
       }
+      
+      
+      
+      
 
       case "select_index": {
         const idx1 = Number(a.params?.index ?? 0); // 1-based
@@ -761,13 +1149,19 @@ export default function App() {
       }
 
       case "clear_cart": {
-        setCart([]);
-        setDiscountPct(0);
-        setQty(1);
-        qtyRef.current = 1;
-        appendLog("carrito vacío");
+        showConfirm({
+          message: "¿Vaciar carrito?",
+          onOk: () => {
+            setCart([]);
+            setDiscountPct(0);
+            setQty(1);
+            qtyRef.current = 1;
+            appendLog("carrito vacío");
+          },
+        });
         break;
       }
+      
 
       case "repeat": {
         appendLog(
@@ -778,221 +1172,297 @@ export default function App() {
         break;
       }
 
+      case "remove_last_item": {
+        setCart((c) => {
+          if (!c.length) { appendLog("carrito vacío"); return c; }
+          const removed = c[c.length - 1];
+          appendLog(`- eliminado último: ${removed.item_name} x${removed.qty}`);
+          return c.slice(0, -1);
+        });
+        break;
+      }
+      
+      case "remove_from_cart": {
+        const idxRaw = a.params?.index;
+        const itemCode = (a.params as any)?.item_code || (a.params as any)?.code;
+        const nameRaw = (a.params as any)?.name || (a.params as any)?.item_name;
+      
+        setCart((c) => {
+          if (!c.length) { appendLog("carrito vacío"); return c; }
+      
+          // 1) Por índice (1-based)
+          const idx = Number(idxRaw);
+          if (Number.isInteger(idx) && idx >= 1 && idx <= c.length) {
+            const removed = c[idx - 1];
+            appendLog(`- eliminado #${idx}: ${removed.item_name} x${removed.qty}`);
+            return [...c.slice(0, idx - 1), ...c.slice(idx)];
+          }
+      
+          // 2) Por item_code exacto
+          if (itemCode) {
+            const i = c.findIndex(row => row.item_code === itemCode);
+            if (i >= 0) {
+              const removed = c[i];
+              appendLog(`- eliminado ${removed.item_name} (${itemCode})`);
+              return [...c.slice(0, i), ...c.slice(i + 1)];
+            }
+          }
+      
+          // 3) Por nombre (contains, insensible a acentos)
+          if (nameRaw) {
+            const norm = (s:string) => stripDiacritics(s).toLowerCase().replace(/\s+/g, " ").trim();
+            const target = norm(nameRaw);
+            const i = c.findIndex(row => norm(row.item_name).includes(target));
+            if (i >= 0) {
+              const removed = c[i];
+              appendLog(`- eliminado ${removed.item_name}`);
+              return [...c.slice(0, i), ...c.slice(i + 1)];
+            }
+          }
+      
+          appendLog("⚠ no encontré el ítem a eliminar");
+          return c;
+        });
+        break;
+      }
+      
+      
+
       default:
         appendLog(`acción desconocida: ${a.action}`);
     }
   }
 
 // ===== VOZ (hook)
+// ===== VOZ (hook)
+const phraseBufRef = useRef<{ acc: string; timer: number | null }>({ acc: "", timer: null });
+
 const voice = useRealtimeVoice({
   bridgeBase: BRIDGE_BASE,
 
   onUserText: async (raw) => {
-    const waitUntilResults = async (timeoutMs = 3000) => {
-      const t0 = Date.now();
-      while (Date.now() - t0 < timeoutMs) {
-        if (resultsRef.current.length > 0) return true;
-        await new Promise((r) => setTimeout(r, 60));
-      }
-      return resultsRef.current.length > 0;
-    };
+    // ----- 0) Ensamblador de micro-frases con debounce -----
+    const seg = (raw || "").trim();
+    if (!seg) return;
 
-    let text = (raw || "").trim();
-    {
-      const now = Date.now();
-      const arr = recentVoiceRef.current;
-      while (arr.length && now - arr[0].t > 3000) arr.shift();
-      const already =
-        (arr as any).findLast?.((x: any) => x.text === text) ||
-        arr.slice().reverse().find((x) => x.text === text);
-      if (already && now - (already as any).t < 1500) {
-        appendLog("⏩ ignorado duplicado de voz (texto repetido)");
+    // acumulamos en buffer
+    if (phraseBufRef.current.timer) {
+      clearTimeout(phraseBufRef.current.timer);
+      phraseBufRef.current.timer = null;
+    }
+    phraseBufRef.current.acc = (phraseBufRef.current.acc ? phraseBufRef.current.acc + " " : "") + seg;
+
+    // cuando pasan 700ms sin nuevos segmentos, “cerramos” la frase y recién ahí interpretamos
+    phraseBufRef.current.timer = window.setTimeout(async () => {
+      const buffered = phraseBufRef.current.acc.trim();
+      phraseBufRef.current.acc = "";
+      phraseBufRef.current.timer = null;
+      if (!buffered) return;
+
+      // ----- 1) lo que ya tenías (idéntico), pero usando `buffered` en lugar de `raw` -----
+      const waitUntilResults = async (timeoutMs = 3000) => {
+        const t0 = Date.now();
+        while (Date.now() - t0 < timeoutMs) {
+          if (resultsRef.current.length > 0) return true;
+          await new Promise((r) => setTimeout(r, 60));
+        }
+        return resultsRef.current.length > 0;
+      };
+
+      let text = buffered;
+      {
+        const now = Date.now();
+        const arr = recentVoiceRef.current;
+        while (arr.length && now - arr[0].t > 3000) arr.shift();
+        const already =
+          (arr as any).findLast?.((x: any) => x.text === text) ||
+          arr.slice().reverse().find((x) => x.text === text);
+        if (already && now - (already as any).t < 2500) {
+          appendLog("⏩ ignorado duplicado de voz (texto repetido)");
+          return;
+        }
+        arr.push({ text, t: now });
+      }
+
+      const lower = text.toLowerCase().replace(/[.!?]\s*$/g, "");
+      const norm = lower.replace(/\bpor\b/g, " x ").replace(/\s+/g, " ").trim();
+
+      appendLog(`🎙️ usuario: ${text}`);
+
+      // Confirmar directo
+      if (/\bconfirm\w*\b/i.test(norm)) {
+        if (mode === "FACTURA" && !paymentSel.mop) {
+          await dispatchAction({ action: "set_payment", params: { mop: "Cash" } });
+        }
+        await dispatchAction({ action: "confirm_document" });
         return;
       }
-      arr.push({ text, t: now });
-    }
 
-    const lower = text.toLowerCase().replace(/[.!?]\s*$/g, "");
-    const norm = lower.replace(/\bpor\b/g, " x ").replace(/\s+/g, " ").trim();
-
-    appendLog(`🎙️ usuario: ${text}`);
-
-    // Confirmar directo
-    if (/\bconfirm\w*\b/i.test(norm)) {
-      if (mode === "FACTURA" && !paymentSel.mop) {
-        await dispatchAction({ action: "set_payment", params: { mop: "Cash" } });
+      // "pago <método>"
+      const mPago = norm.match(/^pago\s+(.+)$/i);
+      if (mPago) {
+        const mopRaw = mPago[1].trim();
+        const mop = normalizeMop(mopRaw) ?? mopRaw;
+        await dispatchAction({ action: "set_payment", params: { mop } });
+        return;
       }
-      await dispatchAction({ action: "confirm_document" });
-      return;
-    }
+      if (
+        mode === "FACTURA" &&
+        /^(efectivo|cash|transferencia|tarjeta(?:\s+(?:credito|crédito|debito|débito))?)$/i.test(norm)
+      ) {
+        const mop = normalizeMop(norm) ?? norm;
+        await dispatchAction({ action: "set_payment", params: { mop } });
+        return;
+      }
 
-    // "pago <método>"
-    const mPago = norm.match(/^pago\s+(.+)$/i);
-    if (mPago) {
-      const mopRaw = mPago[1].trim();
-      const mop = normalizeMop(mopRaw) ?? mopRaw;
-      await dispatchAction({ action: "set_payment", params: { mop } });
-      return;
-    }
-    if (
-      mode === "FACTURA" &&
-      /^(efectivo|cash|transferencia|tarjeta(?:\s+(?:credito|crédito|debito|débito))?)$/i.test(norm)
-    ) {
-      const mop = normalizeMop(norm) ?? norm;
-      await dispatchAction({ action: "set_payment", params: { mop } });
-      return;
-    }
+      // 1) Planner primero
+      try {
+        const resumen = await interpretAndDispatch(text);
+        if (resumen) (voice as any).speak(resumen);
+        return;
+      } catch (e) {
+        const msg = (e as any)?.message ?? "Error procesando el pedido";
+        appendLog(`✖ voz→interpret: ${msg}`);
+      }
 
-    // 1) Planner primero
-    try {
-      const resumen = await interpretAndDispatch(text);
-      if (resumen) (voice as any).speak(resumen);
-      return;
-    } catch (e) {
-      const msg = (e as any)?.message ?? "Error procesando el pedido";
-      appendLog(`✖ voz→interpret: ${msg}`);
-    }
+      // 2) Atajos locales (fallback)
 
-    // 2) Atajos locales (fallback)
+      // MODO
+      if (/^modo\s+(presupuesto|factura|remito)$/i.test(norm)) {
+        const m = norm.match(/^modo\s+(presupuesto|factura|remito)$/i)!;
+        const modo = m[1].toUpperCase();
+        await dispatchAction({ action: "set_mode", params: { mode: modo } });
+        (voice as any).speak(`Modo ${m[1]}.`);
+        return;
+      }
 
-    // MODO
-    if (/^modo\s+(presupuesto|factura|remito)$/i.test(norm)) {
-      const m = norm.match(/^modo\s+(presupuesto|factura|remito)$/i)!;
-      const modo = m[1].toUpperCase();
-      await dispatchAction({ action: "set_mode", params: { mode: modo } });
-      (voice as any).speak(`Modo ${m[1]}.`);
-      return;
-    }
+      // “Buscar <algo>”
+      const mBuscar = norm.match(/^(?:busca|buscar|buscá|buscame|buscáme)\s+(.+)$/i);
+      if (mBuscar) {
+        const term = mBuscar[1].trim();
+        await dispatchAction({ action: "search", params: { term } });
+        return;
+      }
 
-    // “Buscar <algo>”
-    const mBuscar = norm.match(/^(?:busca|buscar|buscá|buscame|buscáme)\s+(.+)$/i);
-    if (mBuscar) {
-      const term = mBuscar[1].trim();
-      await dispatchAction({ action: "search", params: { term } });
-      return;
-    }
+      // Fallback 1 palabra → búsqueda
+      if (!/\s/.test(norm) && norm.length >= 2) {
+        await dispatchAction({ action: "search", params: { term: norm } });
+        return;
+      }
 
-    // Fallback 1 palabra → búsqueda
-    if (!/\s/.test(norm) && norm.length >= 2) {
+      // “ítem N, cantidad Q”
+      const mSelQty = norm.match(/^(?:ítem|item)\s+(\d+)\s*,?\s*cantidad\s+(\d+)$/i);
+      if (mSelQty) {
+        const idx = Number(mSelQty[1]);
+        const q = Math.max(1, Number(mSelQty[2]));
+        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+          (voice as any).speak("Decime primero qué buscar.");
+          return;
+        }
+        await dispatchAction({ action: "select_index", params: { index: idx } });
+        await dispatchAction({ action: "set_qty", params: { qty: q } });
+        return;
+      }
+
+      // “del ítem N agregar Q”
+      const mDelSelAdd = norm.match(
+        /^del\s+(?:ítem|item)\s+(\d+)\s*,?\s*(?:agrega(?:r)?|sumar|añadir|poner)\s*(\d+)\s*(?:unidades?)?$/i
+      );
+      if (mDelSelAdd) {
+        const idx = Number(mDelSelAdd[1]);
+        const q = Math.max(1, Number(mDelSelAdd[2]));
+        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+          (voice as any).speak("Decime primero qué buscar.");
+          return;
+        }
+        await dispatchAction({ action: "select_index", params: { index: idx } });
+        await dispatchAction({ action: "set_qty", params: { qty: q } });
+        await dispatchAction({ action: "add_to_cart", params: { index: idx } });
+        (voice as any).speak("Listo.");
+        return;
+      }
+
+      // “item N agregar Q”
+      const mSelAdd = norm.match(/^(?:ítem|item)\s+(\d+)\s*,?\s*(?:agrega(?:r)?|sumar|añadir|poner)\s*(\d+)?$/i);
+      if (mSelAdd) {
+        const idx = Number(mSelAdd[1]);
+        const qOpt = mSelAdd[2] ? Math.max(1, Number(mSelAdd[2])) : null;
+        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+          (voice as any).speak("Decime primero qué buscar.");
+          return;
+        }
+        await dispatchAction({ action: "select_index", params: { index: idx } });
+        if (qOpt) await dispatchAction({ action: "set_qty", params: { qty: qOpt } });
+        await dispatchAction({ action: "add_to_cart", params: { index: idx } });
+        (voice as any).speak("Listo.");
+        return;
+      }
+
+      // “agregar ítem” (sin N)
+      if (/^(?:agrega(?:r)?|sumar|añadir|poner)\s+(?:el\s+)?(?:ítem|item)\b$/i.test(norm)) {
+        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+          (voice as any).speak("Decime primero qué buscar.");
+          return;
+        }
+        const idx = selectedIndex ?? (resultsRef.current.length > 0 ? 1 : null);
+        if (!idx) {
+          appendLog("no hay selección");
+          return;
+        }
+        await dispatchAction({ action: "select_index", params: { index: idx } });
+        await dispatchAction({ action: "add_to_cart", params: { index: idx } });
+        (voice as any).speak("Listo.");
+        return;
+      }
+
+      // “cantidad Q”
+      const mQty = norm.match(/^(?:cantidad|poner)\s+(\d+)$/i);
+      if (mQty) {
+        const q = Math.max(1, Number(mQty[1]));
+        await dispatchAction({ action: "set_qty", params: { qty: q } });
+        (voice as any).speak(`Cantidad ${q}.`);
+        return;
+      }
+
+      // “ítem N” (selección directa)
+      const mSel = norm.match(/^(?:ítem|item)\s+(\d+)$/i);
+      if (mSel) {
+        const idx = Number(mSel[1]);
+        if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
+          (voice as any).speak("Decime primero qué buscar.");
+          return;
+        }
+        await dispatchAction({ action: "select_index", params: { index: idx } });
+        return;
+      }
+
+      // último fallback
       await dispatchAction({ action: "search", params: { term: norm } });
-      return;
-    }
-
-    // “ítem N, cantidad Q”
-    const mSelQty = norm.match(/^(?:ítem|item)\s+(\d+)\s*,?\s*cantidad\s+(\d+)$/i);
-    if (mSelQty) {
-      const idx = Number(mSelQty[1]);
-      const q = Math.max(1, Number(mSelQty[2]));
-      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-        (voice as any).speak("Decime primero qué buscar.");
-        return;
-      }
-      await dispatchAction({ action: "select_index", params: { index: idx } });
-      await dispatchAction({ action: "set_qty", params: { qty: q } });
-      return;
-    }
-
-    // “del ítem N agregar Q”
-    const mDelSelAdd = norm.match(
-      /^del\s+(?:ítem|item)\s+(\d+)\s*,?\s*(?:agrega(?:r)?|sumar|añadir|poner)\s*(\d+)\s*(?:unidades?)?$/i
-    );
-    if (mDelSelAdd) {
-      const idx = Number(mDelSelAdd[1]);
-      const q = Math.max(1, Number(mDelSelAdd[2]));
-      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-        (voice as any).speak("Decime primero qué buscar.");
-        return;
-      }
-      await dispatchAction({ action: "select_index", params: { index: idx } });
-      await dispatchAction({ action: "set_qty", params: { qty: q } });
-      await dispatchAction({ action: "add_to_cart", params: { index: idx } });
-      (voice as any).speak("Listo.");
-      return;
-    }
-
-    // “item N agregar Q”
-    const mSelAdd = norm.match(/^(?:ítem|item)\s+(\d+)\s*,?\s*(?:agrega(?:r)?|sumar|añadir|poner)\s*(\d+)?$/i);
-    if (mSelAdd) {
-      const idx = Number(mSelAdd[1]);
-      const qOpt = mSelAdd[2] ? Math.max(1, Number(mSelAdd[2])) : null;
-      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-        (voice as any).speak("Decime primero qué buscar.");
-        return;
-      }
-      await dispatchAction({ action: "select_index", params: { index: idx } });
-      if (qOpt) await dispatchAction({ action: "set_qty", params: { qty: qOpt } });
-      await dispatchAction({ action: "add_to_cart", params: { index: idx } });
-      (voice as any).speak("Listo.");
-      return;
-    }
-
-    // “agregar (el) ítem N (x|por|de Q)?”
-    const mAdd = norm.match(
-      /^(?:agrega(?:r)?|sumar|añadir|poner)\s+(?:el\s+)?(?:ítem|item)\s+(\d+)(?:\s*(?:x|por|de)\s*(\d+))?$/i
-    );
-    if (mAdd) {
-      const idx = Number(mAdd[1]);
-      const qOpt = mAdd[2] ? Math.max(1, Number(mAdd[2])) : null;
-      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-        (voice as any).speak("Decime primero qué buscar.");
-        return;
-      }
-      await dispatchAction({ action: "select_index", params: { index: idx } });
-      if (qOpt) await dispatchAction({ action: "set_qty", params: { qty: qOpt } });
-      await dispatchAction({ action: "add_to_cart", params: { index: idx } });
-      (voice as any).speak("Listo.");
-      return;
-    }
-
-    // “agregar ítem” (sin N)
-    if (/^(?:agrega(?:r)?|sumar|añadir|poner)\s+(?:el\s+)?(?:ítem|item)\b$/i.test(norm)) {
-      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-        (voice as any).speak("Decime primero qué buscar.");
-        return;
-      }
-      const idx = selectedIndex ?? (resultsRef.current.length > 0 ? 1 : null);
-      if (!idx) {
-        appendLog("no hay selección");
-        return;
-      }
-      await dispatchAction({ action: "select_index", params: { index: idx } });
-      await dispatchAction({ action: "add_to_cart", params: { index: idx } });
-      (voice as any).speak("Listo.");
-      return;
-    }
-
-    // “cantidad Q”
-    const mQty = norm.match(/^(?:cantidad|poner)\s+(\d+)$/i);
-    if (mQty) {
-      const q = Math.max(1, Number(mQty[1]));
-      await dispatchAction({ action: "set_qty", params: { qty: q } });
-      (voice as any).speak(`Cantidad ${q}.`);
-      return;
-    }
-
-    // “ítem N” (selección directa)
-    const mSel = norm.match(/^(?:ítem|item)\s+(\d+)$/i);
-    if (mSel) {
-      const idx = Number(mSel[1]);
-      if (resultsRef.current.length === 0 && !(await waitUntilResults())) {
-        (voice as any).speak("Decime primero qué buscar.");
-        return;
-      }
-      await dispatchAction({ action: "select_index", params: { index: idx } });
-      return;
-    }
-
-    // último fallback
-    await dispatchAction({ action: "search", params: { term: norm } });
+    }, 700); // <-- ventana de “silencio” antes de interpretar
   },
 
   // Opciones del hook
   audioElId: "assistantAudio",
-  onListeningChange: (on: boolean) => { setListening(on); console.log("[voice] listening:", on); },
+  onListeningChange(on: boolean) {
+    setListening(on);
+    console.log("[voice] listening:", on);
+  },
   beeps: true,
   pttMaxMs: 8000,
   onError: (e: any) => appendLog(`⚠ voz: ${e?.message ?? e}`),
-});
+}); // <-- cierre de useRealtimeVoice
+
+
+// cleanup del buffer de frases
+useEffect(() => {
+  return () => {
+    if (phraseBufRef.current.timer) {
+      clearTimeout(phraseBufRef.current.timer);
+      phraseBufRef.current.timer = null;
+    }
+  };
+}, []);
+
 
 // Hotkeys globales: Space / Esc
 useEffect(() => {
@@ -1067,6 +1537,8 @@ useEffect(() => {
       { action: "confirm_document" },
       { action: "clear_cart" },
       { action: "repeat" },
+      { action: "remove_from_cart" },
+      { action: "remove_last_item" },
     ],
   };
 
@@ -1097,6 +1569,8 @@ const ACTIONS_DOC = `
 - set_payment({ mop, account?, amount? })
 - confirm_document()
 - clear_cart()
+- remove_from_cart(index|name)
+- remove_last_item()
 - repeat()
 `;
 
@@ -1272,7 +1746,74 @@ return (
                 }
               }}
             />
-
+            {/* === Chips de filtros aplicados (si existen) === */}
+            {filtersToChips(appliedFilters).length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 mb-2">
+                {filtersToChips(appliedFilters).map((c) => (
+                  <button
+                    key={c.key}
+                    className="text-xs px-2 py-1 rounded-full bg-neutral-100 hover:bg-neutral-200 border"
+                    title="Quitar filtro"
+                    onClick={async () => {
+                      const nf = removeChip(appliedFilters, c.key);
+                      setAppliedFilters(nf);
+                      const term = (searchTerm || "").trim();
+                      if (term) {
+                        const data = await apiSearch(term, nf);
+                        setResults(data);
+                        resultsRef.current = data;
+                        setSelectedIndex(data.length ? 1 : null);
+                        selectedIndexRef.current = data.length ? 1 : 0; // ✅ sincronizado
+                      }
+                    }}
+                  >
+                    {c.label} ×
+                  </button>
+                ))}
+                <button
+                  className="text-xs px-2 py-1 rounded-full bg-neutral-100 hover:bg-neutral-200 border ml-1"
+                  onClick={async () => {
+                    setAppliedFilters(null);
+                    const term = (searchTerm || "").trim();
+                    if (term) {
+                      const data = await apiSearch(term, null);
+                      setResults(data);
+                      resultsRef.current = data;
+                      setSelectedIndex(data.length ? 1 : null);
+                      selectedIndexRef.current = data.length ? 1 : 0; // ✅ sincronizado
+                    }
+                  }}
+                  title="Quitar todos los filtros"
+                >
+                  Limpiar filtros
+                </button>
+              </div>
+            )}
+            
+            {/* Sugerencias del backend (meta.tried_terms) */}
+            {triedTerms.length > 0 && (
+              <div className="text-xs text-neutral-500 mb-2">
+                ¿No apareció lo que buscabas? Probá:{" "}
+                {triedTerms.map((tt, i) => (
+                  <button
+                    key={tt + i}
+                    className="underline mr-2"
+                    onClick={async () => {
+                      setSearchTerm(tt);
+                      const data = await apiSearch(tt, appliedFilters);
+                      setResults(data);
+                      resultsRef.current = data;
+                      setSelectedIndex(data.length ? 1 : null);
+                      selectedIndexRef.current = data.length ? 1 : 0; // ✅ sincronizado
+                    }}
+                  >
+                    {tt}
+                  </button>
+                ))}
+              </div>
+            )}
+            
+            
             <button
               className="rounded-xl px-4 py-2 bg-neutral-800 text-white"
               onClick={async () => {
@@ -1367,6 +1908,7 @@ return (
               const hit = new Set(bi?.hit_fields ?? []);
               const nameNode = hit.has("name") ? highlightText(r.item_name, terms) : r.item_name;
               const codeNode = hit.has("code") ? highlightText(code, terms) : code;
+              
 
               return (
                 <div
@@ -1446,7 +1988,7 @@ return (
               <tbody>
                 {cart.map((c, i) => (
                   <tr key={c.item_code + i} className="border-t">
-                    <td className="p-2">{c.item_name}</td>
+                    <td className="p-2">{i + 1}. {c.item_name}</td>
                     <td className="p-2 text-right">{c.qty} {c.uom}</td>
                     <td className="p-2 text-right">{c.unit_price.toFixed(2)}</td>
                     <td className="p-2 text-right">{c.subtotal.toFixed(2)}</td>
@@ -1509,6 +2051,3 @@ return (
   </div>
 );
 }
-
-
-
